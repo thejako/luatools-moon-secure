@@ -121,12 +121,21 @@ fi
 detect_language() {
 	local l="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
 	case "$l" in
-		pt*|*_BR*|*_PT*) LANG_IS_PT=1 ;;
-		*)               LANG_IS_PT=0 ;;
+		es*|*_ES*)       LANG_IS_ES=1; LANG_IS_PT=0 ;;
+		pt*|*_BR*|*_PT*) LANG_IS_ES=0; LANG_IS_PT=1 ;;
+		*)               LANG_IS_ES=0; LANG_IS_PT=0 ;;
 	esac
 }
 
-L() { if [ "${LANG_IS_PT:-0}" = 1 ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+L() {
+	if [ "${LANG_IS_ES:-0}" = 1 ] && [ -n "${3:-}" ]; then
+		printf '%s' "$3"
+	elif [ "${LANG_IS_PT:-0}" = 1 ]; then
+		printf '%s' "$2"
+	else
+		printf '%s' "$1"
+	fi
+}
 
 log_info()    { echo -e "${NIGHT}→${NC} $1"; }
 log_success() { echo -e "${GREEN}✓${NC} $1"; }
@@ -2791,18 +2800,31 @@ list_steam_accounts() {
 }
 
 find_loginusers_vdf() {
+	if [ -n "${GATEKEEPER_STEAM_ROOT:-}" ] && [ -f "$GATEKEEPER_STEAM_ROOT/config/loginusers.vdf" ]; then
+		printf '%s' "$GATEKEEPER_STEAM_ROOT/config/loginusers.vdf"
+		return 0
+	fi
+	local steam_link_target
+	steam_link_target="$(readlink -e -q "$HOME/.steam/steam" 2>/dev/null || readlink -f "$HOME/.steam/steam" 2>/dev/null || true)"
 	local candidates=(
 		"$HOME/.steam/steam/config/loginusers.vdf"
 		"$HOME/.local/share/Steam/config/loginusers.vdf"
+		${steam_link_target:+"$steam_link_target/config/loginusers.vdf"}
 		"$HOME/.steam/root/config/loginusers.vdf"
 		"$HOME/.steam/debian-installation/config/loginusers.vdf"
 	)
 	for c in "${candidates[@]}"; do
-		if [ -f "$c" ]; then
+		if [ -n "$c" ] && [ -f "$c" ]; then
 			printf '%s' "$c"
 			return 0
 		fi
 	done
+	local found
+	found="$(find "$HOME/.steam" "$HOME/.local/share/Steam" -maxdepth 3 -name "loginusers.vdf" -type f 2>/dev/null | head -n1)"
+	if [ -n "$found" ] && [ -f "$found" ]; then
+		printf '%s' "$found"
+		return 0
+	fi
 	return 1
 }
 
@@ -2812,30 +2834,23 @@ preask_authorized_account() {
 
 	local vdf
 	vdf="$(find_loginusers_vdf || true)"
-	if [ -z "$vdf" ] || [ ! -f "$vdf" ]; then
-		log_info "$(L "No loginusers.vdf found; all accounts will run clean official Steam until configured." \
-		             "loginusers.vdf não encontrado; todas as contas rodarão Steam limpa até ser configurado.")"
-		return 0
-	fi
-
-	local accounts
-	accounts="$(list_steam_accounts "$vdf")"
-	if [ -z "$accounts" ]; then
-		return 0
+	local accounts=""
+	if [ -n "$vdf" ] && [ -f "$vdf" ]; then
+		accounts="$(list_steam_accounts "$vdf")"
 	fi
 
 	local count=0
 	local ids=() accs=() personas=() recents=()
-	while IFS='|' read -r sid acc persona recent; do
-		[ -n "$sid" ] || continue
-		count=$((count + 1))
-		ids+=("$sid")
-		accs+=("$acc")
-		personas+=("$persona")
-		recents+=("$recent")
-	done <<< "$accounts"
-
-	[ "$count" -eq 0 ] && return 0
+	if [ -n "$accounts" ]; then
+		while IFS='|' read -r sid acc persona recent; do
+			[ -n "$sid" ] || continue
+			count=$((count + 1))
+			ids+=("$sid")
+			accs+=("$acc")
+			personas+=("$persona")
+			recents+=("$recent")
+		done <<< "$accounts"
+	fi
 
 	local default_idx=1
 	local i
@@ -2846,36 +2861,84 @@ preask_authorized_account() {
 		fi
 	done
 
-	# In non-interactive environments, default to the MostRecent account
-	if [ ! -t 0 ] || [ "${PREASK_NONINTERACTIVE:-0}" = 1 ]; then
-		local sel_idx=$((default_idx - 1))
-		OPT_AUTHORIZED_STEAMID="${ids[$sel_idx]}"
-		OPT_AUTHORIZED_PERSONA="${personas[$sel_idx]}"
-		OPT_AUTHORIZED_ACCOUNT="${accs[$sel_idx]}"
+	local tty_in="" tty_out=""
+	if [ -e /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then
+		tty_in="/dev/tty"
+		tty_out="/dev/tty"
+	elif [ -t 0 ]; then
+		tty_in="/dev/stdin"
+		tty_out="/dev/stdout"
+	fi
+
+	# Truly non-interactive environment without a controlling terminal
+	if [ -z "$tty_in" ] || [ "${PREASK_NONINTERACTIVE:-0}" = 1 ]; then
+		if [ "$count" -gt 0 ]; then
+			local sel_idx=$((default_idx - 1))
+			OPT_AUTHORIZED_STEAMID="${ids[$sel_idx]}"
+			OPT_AUTHORIZED_PERSONA="${personas[$sel_idx]}"
+			OPT_AUTHORIZED_ACCOUNT="${accs[$sel_idx]}"
+		fi
+		return 0
+	fi
+
+	# Interactive fallback if no accounts were discovered automatically
+	if [ "$count" -eq 0 ]; then
+		log_warn "$(L "No configured Steam accounts were automatically detected." \
+		              "Nenhuma conta Steam configurada foi detectada automaticamente." \
+		              "No se detectaron cuentas de Steam configuradas automáticamente.")"
+		printf "  %s" "$(L "Enter your SteamID64 manually (or press Enter to skip): " \
+		                 "Digite seu SteamID64 manualmente (ou pressione Enter para pular): " \
+		                 "Introduce tu SteamID64 manualmente (o pulsa Enter para omitir): ")" >"$tty_out"
+		local manual_id=""
+		IFS= read -r manual_id <"$tty_in" || manual_id=""
+		manual_id="$(printf '%s' "$manual_id" | tr -d '[:space:]')"
+		if [[ "$manual_id" =~ ^[0-9]{17}$ ]]; then
+			OPT_AUTHORIZED_STEAMID="$manual_id"
+			OPT_AUTHORIZED_PERSONA="User"
+			OPT_AUTHORIZED_ACCOUNT="manual"
+			log_success "$(L "Authorized account configured: ${OPT_AUTHORIZED_STEAMID}" \
+			             "Conta autorizada configurada: ${OPT_AUTHORIZED_STEAMID}" \
+			             "Cuenta autorizada configurada: ${OPT_AUTHORIZED_STEAMID}")"
+		else
+			log_info "$(L "No account selected; all accounts will run clean official Steam until configured." \
+			             "Nenhuma conta selecionada; todas as contas rodarão Steam limpa até ser configurado." \
+			             "Ninguna cuenta seleccionada; todas las cuentas ejecutarán Steam limpia hasta configurarse.")"
+		fi
 		return 0
 	fi
 
 	print_section "$(L "Security Gatekeeper: Select Authorized Account" \
-	                   "Gatekeeper de Segurança: Selecione a Conta Autorizada")"
+	                   "Gatekeeper de Segurança: Selecione a Conta Autorizada" \
+	                   "Gatekeeper de Seguridad: Seleccionar Cuenta Autorizada")"
 	log_info "$(L "Select the specific Steam account that should have LuaTools & SLSsteam enabled." \
-	             "Selecione a conta Steam específica que terá LuaTools e SLSsteam ativados.")"
+	             "Selecione a conta Steam específica que terá LuaTools e SLSsteam ativados." \
+	             "Selecciona la cuenta de Steam específica que tendrá LuaTools y SLSsteam habilitados.")"
 	log_info "$(L "Other accounts will run 100% clean official Steam with original Valve Cloud saves." \
-	             "Outras contas rodarão a Steam 100% limpa e oficial com saves originais da Valve.")"
-	echo ""
+	             "Outras contas rodarão a Steam 100% limpa e oficial com saves originais da Valve." \
+	             "Las demás cuentas ejecutarán Steam oficial 100% limpia con guardado en la nube original de Valve.")"
+	printf "\n" >"$tty_out"
 
 	for ((i=0; i<count; i++)); do
 		local marker=" "
 		[ "$((i + 1))" -eq "$default_idx" ] && marker="*"
-		printf "  [%d]%s %s (%s) — SteamID: %s\n" "$((i + 1))" "$marker" "${personas[$i]}" "${accs[$i]}" "${ids[$i]}"
+		printf "  [%d]%s %s (%s) — SteamID: %s\n" "$((i + 1))" "$marker" "${personas[$i]:-Unknown}" "${accs[$i]:-User}" "${ids[$i]}" >"$tty_out"
 	done
-	echo ""
-	printf "  $(L "Enter account number [default: %d]: " "Digite o número da conta [padrão: %d]: ")" "$default_idx"
+	printf "\n" >"$tty_out"
 
-	local choice
-	read -r choice || choice=""
-	if [ -z "$choice" ] || ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
-		choice="$default_idx"
-	fi
+	local choice=""
+	while true; do
+		printf "  %s" "$(printf "$(L "Enter account number [default: %d]: " "Digite o número da conta [padrão: %d]: " "Introduce el número de cuenta [por defecto: %d]: ")" "$default_idx")" >"$tty_out"
+		IFS= read -r choice <"$tty_in" || choice=""
+		choice="$(printf '%s' "$choice" | tr -d '[:space:]')"
+		if [ -z "$choice" ]; then
+			choice="$default_idx"
+			break
+		fi
+		if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+			break
+		fi
+		echo "$(printf "$(L "Invalid selection. Please enter a number between 1 and %d." "Seleção inválida. Digite um número entre 1 e %d." "Selección no válida. Introduce un número entre 1 y %d.")" "$count")" >"$tty_out"
+	done
 
 	local chosen_idx=$((choice - 1))
 	OPT_AUTHORIZED_STEAMID="${ids[$chosen_idx]}"
@@ -2883,7 +2946,8 @@ preask_authorized_account() {
 	OPT_AUTHORIZED_ACCOUNT="${accs[$chosen_idx]}"
 
 	log_success "$(L "Authorized account: ${OPT_AUTHORIZED_PERSONA} (${OPT_AUTHORIZED_STEAMID})" \
-	             "Conta autorizada: ${OPT_AUTHORIZED_PERSONA} (${OPT_AUTHORIZED_STEAMID})")"
+	             "Conta autorizada: ${OPT_AUTHORIZED_PERSONA} (${OPT_AUTHORIZED_STEAMID})" \
+	             "Cuenta autorizada: ${OPT_AUTHORIZED_PERSONA} (${OPT_AUTHORIZED_STEAMID})")"
 }
 
 gatekeeper_script_content() {
@@ -2919,6 +2983,12 @@ find_steam_root() {
         "$HOME/.steam/root"
         "$HOME/.steam/debian-installation"
     )
+    for c in "${candidates[@]}"; do
+        if [ -f "$c/config/loginusers.vdf" ]; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
     for c in "${candidates[@]}"; do
         if [ -d "$c/config" ]; then
             printf '%s' "$c"
@@ -2980,12 +3050,18 @@ get_active_steamid() {
         /^[[:space:]]*"[0-9]+"/ {
             current_id = $1
             gsub(/"/, "", current_id)
+            count++
+            if (first_id == "") first_id = current_id
         }
         /"MostRecent"[[:space:]]+"1"/ {
             active_id = current_id
         }
         END {
-            if (active_id != "") print active_id
+            if (active_id != "") {
+                print active_id
+            } else if (count == 1) {
+                print first_id
+            }
         }
     ' "$vdf" 2>/dev/null
 }
@@ -3091,19 +3167,34 @@ install_gatekeeper() {
 	gatekeeper_script_content > "$wrapper"
 	chmod 0755 "$wrapper" 2>/dev/null || true
 
-	# Persist security configuration
-	cat > "$cfg_file" << EOF
+	# Persist security configuration safely
+	local safe_persona safe_account
+	safe_persona="$(printf '%s' "$OPT_AUTHORIZED_PERSONA" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+	safe_account="$(printf '%s' "$OPT_AUTHORIZED_ACCOUNT" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+
+	if command -v jq >/dev/null 2>&1; then
+		jq -n \
+			--arg sid "$OPT_AUTHORIZED_STEAMID" \
+			--arg persona "$OPT_AUTHORIZED_PERSONA" \
+			--arg account "$OPT_AUTHORIZED_ACCOUNT" \
+			--arg updated "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)" \
+			'{authorized_steamid: $sid, authorized_persona_name: $persona, authorized_account_name: $account, updated_at: $updated}' \
+			> "$cfg_file"
+	else
+		cat > "$cfg_file" << EOF
 {
   "authorized_steamid": "$OPT_AUTHORIZED_STEAMID",
-  "authorized_persona_name": "$OPT_AUTHORIZED_PERSONA",
-  "authorized_account_name": "$OPT_AUTHORIZED_ACCOUNT",
+  "authorized_persona_name": "$safe_persona",
+  "authorized_account_name": "$safe_account",
   "updated_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
 }
 EOF
+	fi
 	chmod 0600 "$cfg_file" 2>/dev/null || true
 
 	log_success "$(L "Security Gatekeeper installed (Authorized SteamID: ${OPT_AUTHORIZED_STEAMID:-none})" \
-	             "Gatekeeper de segurança instalado (SteamID autorizado: ${OPT_AUTHORIZED_STEAMID:-nenhum})")"
+	             "Gatekeeper de segurança instalado (SteamID autorizado: ${OPT_AUTHORIZED_STEAMID:-nenhum})" \
+	             "Gatekeeper de seguridad instalado (SteamID autorizado: ${OPT_AUTHORIZED_STEAMID:-ninguno})")"
 }
 
 # ============================================================================

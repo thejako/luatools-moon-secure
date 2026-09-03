@@ -48,10 +48,30 @@ Reference material:
 
 Open an issue: https://github.com/swwayps/luatools-moon/issues
 
+## Test & Verify Installation
+
+Verify that all components (Steam environment, SLSsteam, Lumen, LuaTools plugin, Security Gatekeeper, and Account Isolation) are installed and functioning properly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thejako/luatools-moon-secure/main/check-install.sh | bash
+```
+
+Or if you have the repository cloned:
+
+```bash
+bash check-install.sh
+```
+
 ## Uninstall
 
-Want to remove everything? Run:
+Completely remove the full stack (slsteam-moon, Lumen, LuaTools plugin, Security Gatekeeper, and CloudRedirect), restoring Steam to its original clean state:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/thejako/luatools-moon-secure/main/uninstall.sh | bash
+```
+
+Or if you have the repository cloned:
+
+```bash
+bash uninstall.sh
 ```

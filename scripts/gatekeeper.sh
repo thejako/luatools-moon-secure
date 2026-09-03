@@ -32,6 +32,12 @@ find_steam_root() {
         "$HOME/.steam/debian-installation"
     )
     for c in "${candidates[@]}"; do
+        if [ -f "$c/config/loginusers.vdf" ]; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
+    for c in "${candidates[@]}"; do
         if [ -d "$c/config" ]; then
             printf '%s' "$c"
             return 0
@@ -97,12 +103,18 @@ get_active_steamid() {
         /^[[:space:]]*"[0-9]+"/ {
             current_id = $1
             gsub(/"/, "", current_id)
+            count++
+            if (first_id == "") first_id = current_id
         }
         /"MostRecent"[[:space:]]+"1"/ {
             active_id = current_id
         }
         END {
-            if (active_id != "") print active_id
+            if (active_id != "") {
+                print active_id
+            } else if (count == 1) {
+                print first_id
+            }
         }
     ' "$vdf" 2>/dev/null
 }
