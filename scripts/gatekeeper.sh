@@ -37,6 +37,12 @@ find_steam_root() {
             return 0
         fi
     done
+    local deep
+    deep="$(find "$HOME/.steam" "$HOME/.local/share/Steam" -maxdepth 3 -name "loginusers.vdf" -type f 2>/dev/null | head -n1)"
+    if [ -n "$deep" ] && [ -f "$deep" ]; then
+        dirname "$(dirname "$deep")"
+        return 0
+    fi
     for c in "${candidates[@]}"; do
         if [ -d "$c/config" ]; then
             printf '%s' "$c"
@@ -105,7 +111,7 @@ get_authorized_steamid() {
     printf '%s' "$res"
 }
 
-# Read active SteamID from loginusers.vdf (the account with MostRecent == 1)
+# Read active SteamID from loginusers.vdf (the account with MostRecent == 1, or latest Timestamp)
 get_active_steamid() {
     local vdf="$1"
     [ -f "$vdf" ] || return 1
@@ -117,12 +123,23 @@ get_active_steamid() {
             count++
             if (first_id == "") first_id = current_id
         }
-        tolower($0) ~ /"mostrecent"[[:space:]]+"1"/ {
+        tolower($0) ~ /"mostrecent"[[:space:]]+"?1"?/ {
             active_id = current_id
+        }
+        tolower($0) ~ /"timestamp"/ {
+            ts = $0
+            sub(/^[[:space:]]*"[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp]"[[:space:]]+"?[^0-9]*/, "", ts)
+            sub(/[^0-9].*$/, "", ts)
+            if (ts + 0 > max_ts) {
+                max_ts = ts + 0
+                latest_id = current_id
+            }
         }
         END {
             if (active_id != "") {
                 print active_id
+            } else if (latest_id != "") {
+                print latest_id
             } else if (count == 1) {
                 print first_id
             }
@@ -231,6 +248,8 @@ main() {
 
     local real_steam
     real_steam="$(find_real_steam)"
+
+    log_gatekeeper "INSPECT: root=${steam_root} vdf=${vdf} (exists: $([ -f "$vdf" ] && echo yes || echo no))"
 
     # Determine execution mode:
     # Fail-Secure policy: If no authorized_id is configured, or active_id cannot be verified,

@@ -214,12 +214,23 @@ get_active_steamid() {
 			count++
 			if (first_id == "") first_id = current_id
 		}
-		tolower($0) ~ /"mostrecent"[[:space:]]+"1"/ {
+		tolower($0) ~ /"mostrecent"[[:space:]]+"?1"?/ {
 			active_id = current_id
+		}
+		tolower($0) ~ /"timestamp"/ {
+			ts = $0
+			sub(/^[[:space:]]*"[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp]"[[:space:]]+"?[^0-9]*/, "", ts)
+			sub(/[^0-9].*$/, "", ts)
+			if (ts + 0 > max_ts) {
+                max_ts = ts + 0
+                latest_id = current_id
+            }
 		}
 		END {
 			if (active_id != "") {
 				print active_id
+			} else if (latest_id != "") {
+				print latest_id
 			} else if (count == 1) {
 				print first_id
 			}
