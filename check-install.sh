@@ -179,23 +179,21 @@ list_steam_accounts() {
 			if (id != "") {
 				print id "|" acc "|" persona "|" recent
 			}
-			id = $1; gsub(/"/, "", id)
+			id = $1; gsub(/[\r"]/, "", id)
 			acc = ""; persona = ""; recent = "0"
 		}
-		/"AccountName"/ {
+		tolower($0) ~ /"accountname"/ {
 			acc = $0
-			sub(/^[[:space:]]*"AccountName"[[:space:]]+"/, "", acc)
-			sub(/"[[:space:]]*$/, "", acc)
+			sub(/^[[:space:]]*"[Aa][Cc][Cc][Oo][Uu][Nn][Tt][Nn][Aa][Mm][Ee]"[[:space:]]+"/, "", acc)
+			sub(/"[\r[:space:]]*$/, "", acc)
 		}
-		/"PersonaName"/ {
+		tolower($0) ~ /"personaname"/ {
 			persona = $0
-			sub(/^[[:space:]]*"PersonaName"[[:space:]]+"/, "", persona)
-			sub(/"[[:space:]]*$/, "", persona)
+			sub(/^[[:space:]]*"[Pp][Ee][Rr][Ss][Oo][Nn][Aa][Nn][Aa][Mm][Ee]"[[:space:]]+"/, "", persona)
+			sub(/"[\r[:space:]]*$/, "", persona)
 		}
-		/"MostRecent"/ {
-			recent = $0
-			sub(/^[[:space:]]*"MostRecent"[[:space:]]+"/, "", recent)
-			sub(/"[[:space:]]*$/, "", recent)
+		tolower($0) ~ /"mostrecent"[[:space:]]+"1"/ {
+			recent = "1"
 		}
 		END {
 			if (id != "") {
@@ -208,14 +206,15 @@ list_steam_accounts() {
 get_active_steamid() {
 	local vdf="$1"
 	[ -f "$vdf" ] || return 1
-	awk '
+	local res
+	res="$(awk '
 		/^[[:space:]]*"[0-9]+"/ {
 			current_id = $1
-			gsub(/"/, "", current_id)
+			gsub(/[\r"]/, "", current_id)
 			count++
 			if (first_id == "") first_id = current_id
 		}
-		/"MostRecent"[[:space:]]+"1"/ {
+		tolower($0) ~ /"mostrecent"[[:space:]]+"1"/ {
 			active_id = current_id
 		}
 		END {
@@ -225,7 +224,9 @@ get_active_steamid() {
 				print first_id
 			}
 		}
-	' "$vdf" 2>/dev/null
+	' "$vdf" 2>/dev/null | tr -d '\r[:space:]')"
+	[ -n "$res" ] || return 1
+	printf '%s' "$res"
 }
 
 # ============================================================================
@@ -337,6 +338,7 @@ check_security_gatekeeper() {
 				auth_id="$(jq -r '.authorized_steamid // empty' "$cfg_file" 2>/dev/null)"
 				auth_persona="$(jq -r '.authorized_persona_name // empty' "$cfg_file" 2>/dev/null)"
 				auth_account="$(jq -r '.authorized_account_name // empty' "$cfg_file" 2>/dev/null)"
+				auth_id="$(printf '%s' "$auth_id" | tr -d '\r[:space:]')"
 				check_pass "$(L "Gatekeeper config.json exists and is valid JSON" \
 				                "Arquivo config.json do Gatekeeper existe e é um JSON válido" \
 				                "El archivo config.json del Gatekeeper existe y es JSON válido")"
@@ -347,6 +349,7 @@ check_security_gatekeeper() {
 			fi
 		else
 			auth_id="$(sed -n 's/.*"authorized_steamid"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$cfg_file" 2>/dev/null | head -n1)"
+			auth_id="$(printf '%s' "$auth_id" | tr -d '\r[:space:]')"
 			check_pass "$(L "Gatekeeper config.json exists" \
 			                "Arquivo config.json do Gatekeeper existe" \
 			                "El archivo config.json del Gatekeeper existe")"
@@ -419,12 +422,12 @@ check_security_gatekeeper() {
 				                "A próxima inicialização da Steam carregará SLSsteam, Lumen e LuaTools." \
 				                "El próximo inicio de Steam cargará SLSsteam, Lumen y LuaTools.")"
 			else
-				check_pass "$(L "ACTIVE USER IS CLEAN / UNAUTHORIZED -> CLEAN MODE" \
-				                "USUÁRIO ATIVO É LIMPO / NÃO AUTORIZADO -> MODO LIMPO OFICIAL" \
-				                "EL USUARIO ACTIVO ES LIMPIO / NO AUTORIZADO -> MODO LIMPIO OFICIAL")" \
-				           "$(L "Next Steam launch runs 100% clean official Steam (Valve Cloud untouched, modifications hidden)." \
-				                "A próxima inicialização rodará Steam 100% limpa (Valve Cloud intacta, mods ocultos)." \
-				                "El próximo inicio ejecutará Steam 100% limpio (Valve Cloud intacto, mods ocultos).")"
+				check_warn "$(L "ACTIVE USER IS CLEAN / UNAUTHORIZED -> CLEAN MODE (MODS DISABLED)" \
+				                "USUÁRIO ATIVO É LIMPO / NÃO AUTORIZADO -> MODO LIMPO (MODS DESATIVADOS)" \
+				                "EL USUARIO ACTIVO ES LIMPIO / NO AUTORIZADO -> MODO LIMPIO (MODS DESACTIVADOS)")" \
+				           "$(L "Steam runs 100% clean official (no LuaTools). Active user (${active_id}) != authorized (${auth_id:-none})." \
+				                "A Steam rodará 100% limpa (sem LuaTools). Usuário ativo (${active_id}) != autorizado (${auth_id:-nenhum})." \
+				                "Steam se ejecutará 100% limpio (sin LuaTools). Usuario activo (${active_id}) != autorizado (${auth_id:-ninguno}).")"
 			fi
 		else
 			check_info "$(L "Could not determine active Steam session (no MostRecent account)" \
@@ -549,8 +552,19 @@ check_optionals() {
 	fi
 
 	# Game Mode systemd drop-in
-	local gm_dropin="$HOME/.config/systemd/user/gamescope-session.service.d/slsteam-moon.conf"
-	if [ -f "$gm_dropin" ]; then
+	local gm_dropin=""
+	local c_gm
+	for c_gm in \
+		"$HOME/.config/systemd/user/steam-launcher.service.d/slsteammoon.conf" \
+		"$HOME/.config/gamescope-session-plus/sessions.d/steam" \
+		"$HOME/.config/gamescope-session/sessions.d/steam" \
+		"$HOME/.config/systemd/user/gamescope-session.service.d/slsteam-moon.conf"; do
+		if [ -f "$c_gm" ]; then
+			gm_dropin="$c_gm"
+			break
+		fi
+	done
+	if [ -n "$gm_dropin" ]; then
 		check_pass "$(L "Game Mode service override active at ${gm_dropin}" \
 		                "Override do serviço Game Mode ativo em ${gm_dropin}" \
 		                "Override del servicio Game Mode activo en ${gm_dropin}")"

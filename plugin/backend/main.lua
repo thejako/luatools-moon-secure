@@ -98,15 +98,25 @@ local function is_session_authorized()
 
     local active_id = nil
     local current_id = nil
+    local first_id = nil
+    local count = 0
     for line in vdf_data:gmatch("[^\r\n]+") do
         local cid = line:match('^[ \t]*"([0-9]+)"')
-        if cid then current_id = cid end
-        if line:find('"MostRecent"[ \t]+"1"') and current_id then
+        if cid then
+            current_id = cid
+            count = count + 1
+            if not first_id then first_id = cid end
+        end
+        if line:lower():find('"mostrecent"[ \t]+"1"') and current_id then
             active_id = current_id
             break
         end
     end
-    if active_id and active_id == tostring(cfg.authorized_steamid) then
+    if not active_id and count == 1 then
+        active_id = first_id
+    end
+    local auth_id = tostring(cfg.authorized_steamid or ""):gsub("[%s\r\n]", "")
+    if active_id and active_id == auth_id then
         return true
     end
     return false

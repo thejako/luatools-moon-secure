@@ -66,6 +66,11 @@ EOF
 active_id="$(get_active_steamid "$VDF")"
 [ "$active_id" = "76561198022222222" ]; check "get_active_steamid: detects MostRecent account" $?
 
+# Test CRLF line endings (standard Valve format on Steam Deck/Linux)
+printf '"users"\r\n{\r\n\t"76561198011111111"\r\n\t{\r\n\t\t"AccountName"\t\t"clean"\r\n\t\t"PersonaName"\t\t"Clean"\r\n\t\t"mostrecent"\t\t"0"\r\n\t}\r\n\t"76561198022222222"\r\n\t{\r\n\t\t"AccountName"\t\t"modded"\r\n\t\t"PersonaName"\t\t"Modded"\r\n\t\t"mostrecent"\t\t"1"\r\n\t}\r\n}\r\n' > "$VDF"
+active_id="$(get_active_steamid "$VDF")"
+[ "$active_id" = "76561198022222222" ]; check "get_active_steamid: handles CRLF and lowercase mostrecent" $?
+
 # Swap MostRecent: clean user becomes active
 cat > "$VDF" << 'EOF'
 "users"
@@ -136,19 +141,21 @@ FAKE_BIN="$TESTDIR/bin"
 mkdir -p "$FAKE_BIN"
 MOCK_LOG="$TESTDIR/mock.log"
 
+RUNNER="${BASH:-$(command -v bash 2>/dev/null || command -v sh)}"
+
 REAL_STEAM_MOCK="$FAKE_BIN/real_steam"
 cat > "$REAL_STEAM_MOCK" << 'EOF'
-#!/usr/bin/env bash
+#!/bin/sh
 echo "LAUNCHED_REAL_STEAM" > "$MOCK_LOG"
 EOF
-chmod +x "$REAL_STEAM_MOCK"
+chmod +x "$REAL_STEAM_MOCK" 2>/dev/null || true
 
 MODDED_WRAPPER_MOCK="$FAKE_BIN/modded_steam"
 cat > "$MODDED_WRAPPER_MOCK" << 'EOF'
-#!/usr/bin/env bash
+#!/bin/sh
 echo "LAUNCHED_MODDED_STEAM" > "$MOCK_LOG"
 EOF
-chmod +x "$MODDED_WRAPPER_MOCK"
+chmod +x "$MODDED_WRAPPER_MOCK" 2>/dev/null || true
 
 # Case A: Active user is authorized modded account -> launches modded steam
 cat > "$CFG" << 'EOF'
@@ -172,7 +179,7 @@ GATEKEEPER_STEAM_ROOT="$FAKE_STEAM" \
 GATEKEEPER_REAL_STEAM="$REAL_STEAM_MOCK" \
 GATEKEEPER_MODDED_WRAPPER="$MODDED_WRAPPER_MOCK" \
 GATEKEEPER_LIB_ONLY=0 \
-bash "$GATEKEEPER_SH"
+"$RUNNER" "$GATEKEEPER_SH"
 
 [ "$(cat "$MOCK_LOG" 2>/dev/null)" = "LAUNCHED_MODDED_STEAM" ]; check "e2e: authorized user triggers modded steam wrapper" $?
 [ -d "$FAKE_STEAM/config/stplug-in" ]; check "e2e: authorized user ensures stplug-in is active" $?
@@ -191,7 +198,7 @@ GATEKEEPER_STEAM_ROOT="$FAKE_STEAM" \
 GATEKEEPER_REAL_STEAM="$REAL_STEAM_MOCK" \
 GATEKEEPER_MODDED_WRAPPER="$MODDED_WRAPPER_MOCK" \
 GATEKEEPER_LIB_ONLY=0 \
-bash "$GATEKEEPER_SH"
+"$RUNNER" "$GATEKEEPER_SH"
 
 [ "$(cat "$MOCK_LOG" 2>/dev/null)" = "LAUNCHED_REAL_STEAM" ]; check "e2e: clean user triggers real steam" $?
 [ ! -d "$FAKE_STEAM/config/stplug-in" ] && [ -d "$FAKE_STEAM/config/stplug-in.modded" ]
@@ -204,7 +211,7 @@ GATEKEEPER_STEAM_ROOT="$FAKE_STEAM" \
 GATEKEEPER_REAL_STEAM="$REAL_STEAM_MOCK" \
 GATEKEEPER_MODDED_WRAPPER="$MODDED_WRAPPER_MOCK" \
 GATEKEEPER_LIB_ONLY=0 \
-bash "$GATEKEEPER_SH"
+"$RUNNER" "$GATEKEEPER_SH"
 
 [ "$(cat "$MOCK_LOG" 2>/dev/null)" = "LAUNCHED_REAL_STEAM" ]; check "e2e: missing vdf fails secure to real steam" $?
 

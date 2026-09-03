@@ -2773,23 +2773,21 @@ list_steam_accounts() {
 			if (id != "") {
 				print id "|" acc "|" persona "|" recent
 			}
-			id = $1; gsub(/"/, "", id)
+			id = $1; gsub(/[\r"]/, "", id)
 			acc = ""; persona = ""; recent = "0"
 		}
-		/"AccountName"/ {
+		tolower($0) ~ /"accountname"/ {
 			acc = $0
-			sub(/^[[:space:]]*"AccountName"[[:space:]]+"/, "", acc)
-			sub(/"[[:space:]]*$/, "", acc)
+			sub(/^[[:space:]]*"[Aa][Cc][Cc][Oo][Uu][Nn][Tt][Nn][Aa][Mm][Ee]"[[:space:]]+"/, "", acc)
+			sub(/"[\r[:space:]]*$/, "", acc)
 		}
-		/"PersonaName"/ {
+		tolower($0) ~ /"personaname"/ {
 			persona = $0
-			sub(/^[[:space:]]*"PersonaName"[[:space:]]+"/, "", persona)
-			sub(/"[[:space:]]*$/, "", persona)
+			sub(/^[[:space:]]*"[Pp][Ee][Rr][Ss][Oo][Nn][Aa][Nn][Aa][Mm][Ee]"[[:space:]]+"/, "", persona)
+			sub(/"[\r[:space:]]*$/, "", persona)
 		}
-		/"MostRecent"/ {
-			recent = $0
-			sub(/^[[:space:]]*"MostRecent"[[:space:]]+"/, "", recent)
-			sub(/"[[:space:]]*$/, "", recent)
+		tolower($0) ~ /"mostrecent"[[:space:]]+"1"/ {
+			recent = "1"
 		}
 		END {
 			if (id != "") {
@@ -3033,27 +3031,38 @@ find_real_steam() {
     printf '%s' "steam"
 }
 
+log_gatekeeper() {
+    local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/slsteam-moon"
+    mkdir -p "$log_dir" 2>/dev/null || true
+    printf '%s %s\n' "$(date '+%F %T' 2>/dev/null || date)" "$1" >> "$log_dir/gatekeeper.log" 2>/dev/null || true
+}
+
 get_authorized_steamid() {
     local cfg="$1"
     [ -f "$cfg" ] || return 1
+    local res=""
     if command -v jq >/dev/null 2>&1; then
-        jq -r '.authorized_steamid // empty' "$cfg" 2>/dev/null
+        res="$(jq -r '.authorized_steamid // empty' "$cfg" 2>/dev/null)"
     else
-        sed -n 's/.*"authorized_steamid"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$cfg" 2>/dev/null | head -n1
+        res="$(sed -n 's/.*"authorized_steamid"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$cfg" 2>/dev/null | head -n1)"
     fi
+    res="$(printf '%s' "$res" | tr -d '\r[:space:]')"
+    [ -n "$res" ] || return 1
+    printf '%s' "$res"
 }
 
 get_active_steamid() {
     local vdf="$1"
     [ -f "$vdf" ] || return 1
-    awk '
+    local res
+    res="$(awk '
         /^[[:space:]]*"[0-9]+"/ {
             current_id = $1
-            gsub(/"/, "", current_id)
+            gsub(/[\r"]/, "", current_id)
             count++
             if (first_id == "") first_id = current_id
         }
-        /"MostRecent"[[:space:]]+"1"/ {
+        tolower($0) ~ /"mostrecent"[[:space:]]+"1"/ {
             active_id = current_id
         }
         END {
@@ -3063,7 +3072,9 @@ get_active_steamid() {
                 print first_id
             }
         }
-    ' "$vdf" 2>/dev/null
+    ' "$vdf" 2>/dev/null | tr -d '\r[:space:]')"
+    [ -n "$res" ] || return 1
+    printf '%s' "$res"
 }
 
 manage_stplugin() {
@@ -3127,15 +3138,18 @@ main() {
     real_steam="$(find_real_steam)"
 
     if [ -n "$authorized_id" ] && [ -n "$active_id" ] && [ "$active_id" = "$authorized_id" ]; then
+        log_gatekeeper "AUTHORIZED: active_id=${active_id} matches authorized_id=${authorized_id} -> starting modded Steam"
         manage_stplugin "restore" "$steam_root"
-        if [ -x "$MODDED_WRAPPER" ]; then
+        if [ -x "$MODDED_WRAPPER" ] || [ -f "$MODDED_WRAPPER" ]; then
             exec "$MODDED_WRAPPER" "$@"
         else
+            log_gatekeeper "WARN: Modded wrapper missing at ${MODDED_WRAPPER} -> starting real steam"
             manage_stplugin "hide" "$steam_root"
             sanitize_env_for_clean
             exec "$real_steam" "$@"
         fi
     else
+        log_gatekeeper "CLEAN: active_id=${active_id:-empty} != authorized_id=${authorized_id:-none} -> starting clean official Steam"
         manage_stplugin "hide" "$steam_root"
         sanitize_env_for_clean
         exec "$real_steam" "$@"
