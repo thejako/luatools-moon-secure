@@ -240,6 +240,7 @@ main() {
         log_gatekeeper "AUTHORIZED: active_id=${active_id} matches authorized_id=${authorized_id} -> starting modded Steam"
         manage_stplugin "restore" "$steam_root"
         if [ -x "$MODDED_WRAPPER" ] || [ -f "$MODDED_WRAPPER" ]; then
+            export SLSM_STEAM_BIN="$real_steam"
             exec "$MODDED_WRAPPER" "$@"
         else
             log_gatekeeper "WARN: Modded wrapper missing at ${MODDED_WRAPPER} -> starting real steam"
