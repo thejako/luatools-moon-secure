@@ -1,11 +1,21 @@
-# 🌕 luatools-moon
+# 🌕 luatools-moon-secure
+
+Hardened fork of `luatools-moon` featuring account isolation and an automatic security gatekeeper for SteamOS / Steam Deck.
 
 ## Install
 
-Set up slsteam-moon, Lumen and the LuaTools plugin automatically with a single command:
+Set up slsteam-moon, Lumen and the secure LuaTools stack:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thejako/luatools-moon-secure/main/install.sh | bash
+```
+
+Or clone the repository and run:
+
+```bash
+git clone https://github.com/thejako/luatools-moon-secure.git
+cd luatools-moon-secure
+bash install.sh
 ```
 
 > **Requirements:** Linux x86_64 and **native Steam** installed from your package
@@ -43,5 +53,5 @@ Open an issue: https://github.com/swwayps/luatools-moon/issues
 Want to remove everything? Run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/swwayps/luatools-moon/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thejako/luatools-moon-secure/main/uninstall.sh | bash
 ```

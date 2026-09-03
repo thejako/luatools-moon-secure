@@ -1409,6 +1409,17 @@ uninstall_slsteam_moon() {
 	# Log file written by SLSsteam.so.
 	rm -f "$HOME/.SLSsteam.log" 2>/dev/null || true
 
+	# Gatekeeper security config and isolated stplug-in cleanup
+	rm -rf "$HOME/.config/luatools-secure" "$HOME/.local/share/SLSsteam-secure" 2>/dev/null || true
+	local _sr
+	for _sr in "$HOME/.steam/steam" "$HOME/.local/share/Steam" "$HOME/.steam/root" "$HOME/.steam/debian-installation"; do
+		if [ -d "$_sr/config/stplug-in.modded" ] && [ ! -d "$_sr/config/stplug-in" ]; then
+			mv "$_sr/config/stplug-in.modded" "$_sr/config/stplug-in" 2>/dev/null || true
+		else
+			rm -rf "$_sr/config/stplug-in.modded" 2>/dev/null || true
+		fi
+	done
+
 	log_success "$(L "slsteam-moon removed" "slsteam-moon removido")"
 }
 

@@ -68,6 +68,20 @@ parse_args --noplugin --slsteam-channel beta --plugin-channel beta --lumen-chann
 [ "$OPT_PLUGIN_CHANNEL" = stable ]; check "plugin channel resets to stable" $?
 [ "$OPT_LUMEN_CHANNEL" = stable ];  check "Lumen channel resets to stable" $?
 
+# --- authorized-steamid option ----------------------------------------------
+parse_args --authorized-steamid 76561198011111111
+[ "$OPT_AUTHORIZED_STEAMID" = "76561198011111111" ]; check "--authorized-steamid <id>: sets OPT_AUTHORIZED_STEAMID" $?
+
+parse_args --authorized-steamid=76561198022222222
+[ "$OPT_AUTHORIZED_STEAMID" = "76561198022222222" ]; check "--authorized-steamid=<id>: sets OPT_AUTHORIZED_STEAMID" $?
+
+if parse_args --authorized-steamid; then r=1; else r=0; fi
+check "--authorized-steamid missing value: returns non-zero" "$r"
+[ "$OPT_BAD_ARG" = "--authorized-steamid" ]; check "--authorized-steamid missing value: recorded in OPT_BAD_ARG" $?
+
+parse_args
+[ "$OPT_AUTHORIZED_STEAMID" = "" ]; check "OPT_AUTHORIZED_STEAMID resets to empty on fresh parse" $?
+
 # --- unknown option ---------------------------------------------------------
 if parse_args --bogus; then r=1; else r=0; fi
 check "unknown option: returns non-zero" "$r"

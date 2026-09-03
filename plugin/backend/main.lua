@@ -67,6 +67,63 @@ local function url_encode(value)
     end))
 end
 
+-- ── Security & Account Isolation ─────────────────────────────────────────────
+
+local function get_security_config()
+    local home = os.getenv("HOME") or ""
+    if home == "" then return nil end
+    local path = home .. "/.config/luatools-secure/config.json"
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then return nil end
+    local ok, parsed = pcall(cjson.decode, content)
+    if ok and type(parsed) == "table" then return parsed end
+    return nil
+end
+
+local function is_session_authorized()
+    local cfg = get_security_config()
+    if not cfg or not cfg.authorized_steamid or cfg.authorized_steamid == "" then
+        return true
+    end
+    local base = steam_utils.detect_steam_install_path()
+    if not base or base == "" then return true end
+    local vdf_path = fs.join(base, "config", "loginusers.vdf")
+    local f = io.open(vdf_path, "rb")
+    if not f then return true end
+    local vdf_data = f:read("*a") or ""
+    f:close()
+
+    local active_id = nil
+    local current_id = nil
+    for line in vdf_data:gmatch("[^\r\n]+") do
+        local cid = line:match('^[ \t]*"([0-9]+)"')
+        if cid then current_id = cid end
+        if line:find('"MostRecent"[ \t]+"1"') and current_id then
+            active_id = current_id
+            break
+        end
+    end
+    if active_id and active_id == tostring(cfg.authorized_steamid) then
+        return true
+    end
+    return false
+end
+
+function GetSecurityStatus()
+    local cfg = get_security_config()
+    local is_auth = is_session_authorized()
+    return json_ok({
+        success = true,
+        security_enabled = (cfg ~= nil and cfg.authorized_steamid ~= nil and cfg.authorized_steamid ~= ""),
+        is_authorized = is_auth,
+        authorized_steamid = cfg and cfg.authorized_steamid or nil,
+        authorized_persona = cfg and cfg.authorized_persona_name or nil
+    })
+end
+
 -- ── Webkit file management ───────────────────────────────────────────────────
 
 local function copy_webkit_files()
@@ -214,6 +271,9 @@ function HasLuaToolsForApp(appid)
 end
 
 function StartAddViaLuaTools(appid)
+    if not is_session_authorized() then
+        return json_err("Unauthorized Steam account: LuaTools actions are restricted by security policy.")
+    end
     if type(appid) == "table" then appid = appid.appid end
     local ok, res = pcall(downloads.start_add_via_luatools, tonumber(appid))
     if not ok then return json_err(res) end
@@ -221,6 +281,9 @@ function StartAddViaLuaTools(appid)
 end
 
 function StartAddViaLuaToolsSmart(appid)
+    if not is_session_authorized() then
+        return json_err("Unauthorized Steam account: LuaTools actions are restricted by security policy.")
+    end
     if type(appid) == "table" then appid = appid.appid end
     local ok, res = pcall(downloads.start_add_via_luatools_smart, tonumber(appid))
     if not ok then return json_err(res) end
@@ -519,6 +582,9 @@ function DismissLoadedApps()
 end
 
 function DeleteLuaToolsForApp(appid)
+    if not is_session_authorized() then
+        return json_err("Unauthorized Steam account: LuaTools actions are restricted by security policy.")
+    end
     if type(appid) == "table" then appid = appid.appid end
     appid = tonumber(appid)
     if not appid or appid <= 0 or appid ~= math.floor(appid) then

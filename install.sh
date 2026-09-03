@@ -18,6 +18,8 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+
 # ----------------------------------------------------------------------------
 # Command-line options (parsed by parse_args; see main)
 # ----------------------------------------------------------------------------
@@ -30,6 +32,9 @@ OPT_BAD_ARG=""
 OPT_SLS_CHANNEL="stable"
 OPT_PLUGIN_CHANNEL="stable"
 OPT_LUMEN_CHANNEL="stable"
+OPT_AUTHORIZED_STEAMID=""
+OPT_AUTHORIZED_PERSONA=""
+OPT_AUTHORIZED_ACCOUNT=""
 
 # ----------------------------------------------------------------------------
 # Repositories / release sources
@@ -237,6 +242,7 @@ preask_prompts() {
 	if ! cloudredirect_installed; then
 		resolve_yesno PREASK_CLOUD "$Q_CLOUD_EN" "$Q_CLOUD_PT" "n" || true
 	fi
+	preask_authorized_account
 }
 
 # Mutable-system launcher privilege preflight. This is deliberately best-effort:
@@ -2009,22 +2015,12 @@ activate_plugin_tree() {
 
 install_plugin() {
 	local tmp zip dest rc stage previous
-
-	log_info "$(L "Resolving latest LuaTools plugin release" \
-	             "Buscando a última release do plugin LuaTools")"
-	resolve_component_asset "$OPT_PLUGIN_CHANNEL" "$PLUGIN_REPO" "$PLUGIN_BETA_PATH" \
-		'^luatools-linux\.zip$' latest plugin || rc=$?
-	if [ "${rc:-0}" -eq 2 ]; then fail "$(forge_unreachable_msg)"; fi
-	if [ "${rc:-0}" -ne 0 ]; then
-		fail "$(L "Could not find the plugin release asset." \
-		          "Não foi possível encontrar o asset da release do plugin.")"
+	local local_src=""
+	if [ -n "${SCRIPT_DIR:-}" ] && [ -f "$SCRIPT_DIR/plugin/plugin.json" ]; then
+		local_src="$SCRIPT_DIR/plugin"
+	elif [ -f "./plugin/plugin.json" ]; then
+		local_src="$(pwd)/plugin"
 	fi
-	tmp="$(mktemp -d)"; trap 'rm -rf "${tmp:-}"' RETURN
-	zip="$tmp/$PLUGIN_ASSET"
-
-	log_info "$(L "Downloading plugin" "Baixando o plugin")"
-	download_resolved_asset "$zip" plugin || fail "$(forge_unreachable_msg)"
-	PLUGIN_INFO="$DOWNLOADED_ASSET_INFO"
 
 	# Lumen hosts the plugin under ~/.local/share/Lumen/luatools (the wrapper
 	# points LUMEN_BACKEND_DIR at .../luatools/backend, and the injector reads
@@ -2047,23 +2043,50 @@ install_plugin() {
 		fi
 	fi
 
-	# Extract and validate the release before touching the working installation.
-	extract_zip "$zip" "$tmp/extracted" || fail "$(L "Extraction failed" "Falha na extração")"
-
-	local inner
-	inner="$(find "$tmp/extracted" -maxdepth 2 -name plugin.json -type f | head -n1)"
-	[ -n "$inner" ] || fail "$(L "plugin.json not found in the plugin archive." \
-	                            "plugin.json não encontrado no pacote do plugin.")"
-
 	# Build a complete staged tree on the destination filesystem. This keeps the
 	# current plugin usable until the archive and preserved data are both ready.
 	mkdir -p "$(dirname "$dest")"
 	stage="$(mktemp -d "${dest}.new.XXXXXX")"
-	cp -a "$(dirname "$inner")/." "$stage/" || {
-		rm -rf "$stage"
-		fail "$(L "Could not stage the plugin files; update aborted." \
-		          "Não foi possível preparar os arquivos do plugin; atualização cancelada.")"
-	}
+
+	if [ -n "$local_src" ]; then
+		log_info "$(L "Installing plugin from local secured repository files" \
+		             "Instalando plugin a partir dos arquivos locais do repositório")"
+		cp -a "$local_src/." "$stage/" || {
+			rm -rf "$stage"
+			fail "$(L "Could not stage the plugin files; update aborted." \
+			          "Não foi possível preparar os arquivos do plugin; atualização cancelada.")"
+		}
+		PLUGIN_INFO="local-secure"
+	else
+		log_info "$(L "Resolving latest LuaTools plugin release" \
+		             "Buscando a última release do plugin LuaTools")"
+		resolve_component_asset "$OPT_PLUGIN_CHANNEL" "$PLUGIN_REPO" "$PLUGIN_BETA_PATH" \
+			'^luatools-linux\.zip$' latest plugin || rc=$?
+		if [ "${rc:-0}" -eq 2 ]; then fail "$(forge_unreachable_msg)"; fi
+		if [ "${rc:-0}" -ne 0 ]; then
+			fail "$(L "Could not find the plugin release asset." \
+			          "Não foi possível encontrar o asset da release do plugin.")"
+		fi
+		tmp="$(mktemp -d)"; trap 'rm -rf "${tmp:-}"' RETURN
+		zip="$tmp/$PLUGIN_ASSET"
+
+		log_info "$(L "Downloading plugin" "Baixando o plugin")"
+		download_resolved_asset "$zip" plugin || fail "$(forge_unreachable_msg)"
+		PLUGIN_INFO="$DOWNLOADED_ASSET_INFO"
+
+		# Extract and validate the release before touching the working installation.
+		extract_zip "$zip" "$tmp/extracted" || fail "$(L "Extraction failed" "Falha na extração")"
+
+		local inner
+		inner="$(find "$tmp/extracted" -maxdepth 2 -name plugin.json -type f | head -n1)"
+		[ -n "$inner" ] || fail "$(L "plugin.json not found in the plugin archive." \
+		                            "plugin.json não encontrado no pacote do plugin.")"
+		cp -a "$(dirname "$inner")/." "$stage/" || {
+			rm -rf "$stage"
+			fail "$(L "Could not stage the plugin files; update aborted." \
+			          "Não foi possível preparar os arquivos do plugin; atualização cancelada.")"
+		}
+	fi
 
 	if [ -n "$data_bak" ]; then
 		if ! restore_plugin_data "$stage" "$data_bak"; then
@@ -2728,6 +2751,362 @@ installed_coverage_policy() {
 }
 
 # ============================================================================
+# Step: Security Gatekeeper (Steam Account Isolation)
+# ============================================================================
+
+# Parse all Steam accounts found in loginusers.vdf
+# Output: SteamID|AccountName|PersonaName|MostRecent
+list_steam_accounts() {
+	local vdf="$1"
+	[ -f "$vdf" ] || return 1
+	awk '
+		/^[[:space:]]*"[0-9]+"/ {
+			if (id != "") {
+				print id "|" acc "|" persona "|" recent
+			}
+			id = $1; gsub(/"/, "", id)
+			acc = ""; persona = ""; recent = "0"
+		}
+		/"AccountName"/ {
+			acc = $0
+			sub(/^[[:space:]]*"AccountName"[[:space:]]+"/, "", acc)
+			sub(/"[[:space:]]*$/, "", acc)
+		}
+		/"PersonaName"/ {
+			persona = $0
+			sub(/^[[:space:]]*"PersonaName"[[:space:]]+"/, "", persona)
+			sub(/"[[:space:]]*$/, "", persona)
+		}
+		/"MostRecent"/ {
+			recent = $0
+			sub(/^[[:space:]]*"MostRecent"[[:space:]]+"/, "", recent)
+			sub(/"[[:space:]]*$/, "", recent)
+		}
+		END {
+			if (id != "") {
+				print id "|" acc "|" persona "|" recent
+			}
+		}
+	' "$vdf" 2>/dev/null
+}
+
+find_loginusers_vdf() {
+	local candidates=(
+		"$HOME/.steam/steam/config/loginusers.vdf"
+		"$HOME/.local/share/Steam/config/loginusers.vdf"
+		"$HOME/.steam/root/config/loginusers.vdf"
+		"$HOME/.steam/debian-installation/config/loginusers.vdf"
+	)
+	for c in "${candidates[@]}"; do
+		if [ -f "$c" ]; then
+			printf '%s' "$c"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Prompt or determine which Steam account should have modded privileges
+preask_authorized_account() {
+	[ -n "$OPT_AUTHORIZED_STEAMID" ] && return 0
+
+	local vdf
+	vdf="$(find_loginusers_vdf || true)"
+	if [ -z "$vdf" ] || [ ! -f "$vdf" ]; then
+		log_info "$(L "No loginusers.vdf found; all accounts will run clean official Steam until configured." \
+		             "loginusers.vdf não encontrado; todas as contas rodarão Steam limpa até ser configurado.")"
+		return 0
+	fi
+
+	local accounts
+	accounts="$(list_steam_accounts "$vdf")"
+	if [ -z "$accounts" ]; then
+		return 0
+	fi
+
+	local count=0
+	local ids=() accs=() personas=() recents=()
+	while IFS='|' read -r sid acc persona recent; do
+		[ -n "$sid" ] || continue
+		count=$((count + 1))
+		ids+=("$sid")
+		accs+=("$acc")
+		personas+=("$persona")
+		recents+=("$recent")
+	done <<< "$accounts"
+
+	[ "$count" -eq 0 ] && return 0
+
+	local default_idx=1
+	local i
+	for ((i=0; i<count; i++)); do
+		if [ "${recents[$i]}" = "1" ]; then
+			default_idx=$((i + 1))
+			break
+		fi
+	done
+
+	# In non-interactive environments, default to the MostRecent account
+	if [ ! -t 0 ] || [ "${PREASK_NONINTERACTIVE:-0}" = 1 ]; then
+		local sel_idx=$((default_idx - 1))
+		OPT_AUTHORIZED_STEAMID="${ids[$sel_idx]}"
+		OPT_AUTHORIZED_PERSONA="${personas[$sel_idx]}"
+		OPT_AUTHORIZED_ACCOUNT="${accs[$sel_idx]}"
+		return 0
+	fi
+
+	print_section "$(L "Security Gatekeeper: Select Authorized Account" \
+	                   "Gatekeeper de Segurança: Selecione a Conta Autorizada")"
+	log_info "$(L "Select the specific Steam account that should have LuaTools & SLSsteam enabled." \
+	             "Selecione a conta Steam específica que terá LuaTools e SLSsteam ativados.")"
+	log_info "$(L "Other accounts will run 100% clean official Steam with original Valve Cloud saves." \
+	             "Outras contas rodarão a Steam 100% limpa e oficial com saves originais da Valve.")"
+	echo ""
+
+	for ((i=0; i<count; i++)); do
+		local marker=" "
+		[ "$((i + 1))" -eq "$default_idx" ] && marker="*"
+		printf "  [%d]%s %s (%s) — SteamID: %s\n" "$((i + 1))" "$marker" "${personas[$i]}" "${accs[$i]}" "${ids[$i]}"
+	done
+	echo ""
+	printf "  $(L "Enter account number [default: %d]: " "Digite o número da conta [padrão: %d]: ")" "$default_idx"
+
+	local choice
+	read -r choice || choice=""
+	if [ -z "$choice" ] || ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
+		choice="$default_idx"
+	fi
+
+	local chosen_idx=$((choice - 1))
+	OPT_AUTHORIZED_STEAMID="${ids[$chosen_idx]}"
+	OPT_AUTHORIZED_PERSONA="${personas[$chosen_idx]}"
+	OPT_AUTHORIZED_ACCOUNT="${accs[$chosen_idx]}"
+
+	log_success "$(L "Authorized account: ${OPT_AUTHORIZED_PERSONA} (${OPT_AUTHORIZED_STEAMID})" \
+	             "Conta autorizada: ${OPT_AUTHORIZED_PERSONA} (${OPT_AUTHORIZED_STEAMID})")"
+}
+
+gatekeeper_script_content() {
+	cat << 'EOF'
+#!/usr/bin/env bash
+# ============================================================================
+#  luatools-moon-secure — Gatekeeper Launcher
+# ============================================================================
+#  Acts as a security barrier in front of Steam (Game Mode and Desktop Mode).
+#  Detects the currently active Steam account from loginusers.vdf:
+#    - If it matches the authorized account -> runs with SLSsteam + Lumen + CloudRedirect.
+#    - If it is a clean / unauthorized account -> runs 100% clean official Steam:
+#        * No LD_AUDIT / SLSsteam.so
+#        * No LD_PRELOAD / cloud_redirect.so
+#        * No Lumen sidecar process
+#        * stplug-in/ is hidden (stplug-in.modded) so unowned games do not appear
+#        * Native Valve Steam Cloud works untouched and unintercepted
+# ============================================================================
+
+set -u
+
+GATEKEEPER_CONFIG="${GATEKEEPER_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/luatools-secure/config.json}"
+MODDED_WRAPPER="${GATEKEEPER_MODDED_WRAPPER:-$HOME/.local/share/SLSsteam/path/steam.modded}"
+
+find_steam_root() {
+    if [ -n "${GATEKEEPER_STEAM_ROOT:-}" ] && [ -d "$GATEKEEPER_STEAM_ROOT" ]; then
+        printf '%s' "$GATEKEEPER_STEAM_ROOT"
+        return 0
+    fi
+    local candidates=(
+        "$HOME/.steam/steam"
+        "$HOME/.local/share/Steam"
+        "$HOME/.steam/root"
+        "$HOME/.steam/debian-installation"
+    )
+    for c in "${candidates[@]}"; do
+        if [ -d "$c/config" ]; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
+    if [ -d "$HOME/.steam/steam" ]; then
+        printf '%s' "$HOME/.steam/steam"
+        return 0
+    fi
+    printf '%s' "$HOME/.local/share/Steam"
+}
+
+find_real_steam() {
+    if [ -n "${GATEKEEPER_REAL_STEAM:-}" ] && [ -x "$GATEKEEPER_REAL_STEAM" ]; then
+        printf '%s' "$GATEKEEPER_REAL_STEAM"
+        return 0
+    fi
+
+    local IFS=':'
+    local dir candidate
+    for dir in $PATH; do
+        case "$dir" in
+            *"/.local/share/SLSsteam/path"*)
+                continue
+                ;;
+        esac
+        candidate="$dir/steam"
+        if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    for candidate in /usr/bin/steam /usr/games/steam /usr/local/bin/steam; do
+        if [ -x "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    printf '%s' "steam"
+}
+
+get_authorized_steamid() {
+    local cfg="$1"
+    [ -f "$cfg" ] || return 1
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.authorized_steamid // empty' "$cfg" 2>/dev/null
+    else
+        sed -n 's/.*"authorized_steamid"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$cfg" 2>/dev/null | head -n1
+    fi
+}
+
+get_active_steamid() {
+    local vdf="$1"
+    [ -f "$vdf" ] || return 1
+    awk '
+        /^[[:space:]]*"[0-9]+"/ {
+            current_id = $1
+            gsub(/"/, "", current_id)
+        }
+        /"MostRecent"[[:space:]]+"1"/ {
+            active_id = current_id
+        }
+        END {
+            if (active_id != "") print active_id
+        }
+    ' "$vdf" 2>/dev/null
+}
+
+manage_stplugin() {
+    local mode="$1"
+    local steam_root="$2"
+    local config_dir="$steam_root/config"
+    local active_dir="$config_dir/stplug-in"
+    local modded_dir="$config_dir/stplug-in.modded"
+
+    mkdir -p "$config_dir" 2>/dev/null || true
+
+    if [ "$mode" = "hide" ]; then
+        if [ -d "$active_dir" ] && [ ! -L "$active_dir" ]; then
+            if [ -d "$modded_dir" ]; then
+                rm -rf "$modded_dir.bak" 2>/dev/null || true
+                mv "$modded_dir" "$modded_dir.bak" 2>/dev/null || true
+            fi
+            mv "$active_dir" "$modded_dir" 2>/dev/null || true
+        fi
+    elif [ "$mode" = "restore" ]; then
+        if [ -d "$modded_dir" ] && [ ! -d "$active_dir" ]; then
+            mv "$modded_dir" "$active_dir" 2>/dev/null || true
+        elif [ ! -d "$active_dir" ]; then
+            mkdir -p "$active_dir" 2>/dev/null || true
+        fi
+    fi
+}
+
+sanitize_env_for_clean() {
+    unset LD_AUDIT
+    if [ -n "${LD_PRELOAD:-}" ]; then
+        local new_preload=""
+        local IFS=': '
+        for item in $LD_PRELOAD; do
+            case "$item" in
+                *cloud_redirect.so*) ;;
+                *) new_preload="${new_preload:+$new_preload:}$item" ;;
+            esac
+        done
+        if [ -n "$new_preload" ]; then
+            export LD_PRELOAD="$new_preload"
+        else
+            unset LD_PRELOAD
+        fi
+    fi
+}
+
+main() {
+    local steam_root
+    steam_root="$(find_steam_root)"
+    local vdf="$steam_root/config/loginusers.vdf"
+    local authorized_id
+    authorized_id="$(get_authorized_steamid "$GATEKEEPER_CONFIG" || true)"
+
+    local active_id=""
+    if [ -f "$vdf" ]; then
+        active_id="$(get_active_steamid "$vdf" || true)"
+    fi
+
+    local real_steam
+    real_steam="$(find_real_steam)"
+
+    if [ -n "$authorized_id" ] && [ -n "$active_id" ] && [ "$active_id" = "$authorized_id" ]; then
+        manage_stplugin "restore" "$steam_root"
+        if [ -x "$MODDED_WRAPPER" ]; then
+            exec "$MODDED_WRAPPER" "$@"
+        else
+            manage_stplugin "hide" "$steam_root"
+            sanitize_env_for_clean
+            exec "$real_steam" "$@"
+        fi
+    else
+        manage_stplugin "hide" "$steam_root"
+        sanitize_env_for_clean
+        exec "$real_steam" "$@"
+    fi
+}
+
+if [ "${GATEKEEPER_LIB_ONLY:-0}" = 0 ]; then
+    main "$@"
+fi
+EOF
+}
+
+install_gatekeeper() {
+	local path_dir="$HOME/.local/share/SLSsteam/path"
+	local wrapper="$path_dir/steam"
+	local modded="$path_dir/steam.modded"
+	local cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/luatools-secure"
+	local cfg_file="$cfg_dir/config.json"
+
+	mkdir -p "$path_dir" "$cfg_dir"
+
+	# Move original wrapper to steam.modded if it is not already our gatekeeper
+	if [ -f "$wrapper" ] && ! grep -qF "luatools-moon-secure — Gatekeeper" "$wrapper" 2>/dev/null; then
+		mv -f "$wrapper" "$modded"
+	elif [ ! -f "$modded" ] && [ -f "$wrapper" ]; then
+		cp -f "$wrapper" "$modded"
+	fi
+
+	gatekeeper_script_content > "$wrapper"
+	chmod 0755 "$wrapper" 2>/dev/null || true
+
+	# Persist security configuration
+	cat > "$cfg_file" << EOF
+{
+  "authorized_steamid": "$OPT_AUTHORIZED_STEAMID",
+  "authorized_persona_name": "$OPT_AUTHORIZED_PERSONA",
+  "authorized_account_name": "$OPT_AUTHORIZED_ACCOUNT",
+  "updated_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+}
+EOF
+	chmod 0600 "$cfg_file" 2>/dev/null || true
+
+	log_success "$(L "Security Gatekeeper installed (Authorized SteamID: ${OPT_AUTHORIZED_STEAMID:-none})" \
+	             "Gatekeeper de segurança instalado (SteamID autorizado: ${OPT_AUTHORIZED_STEAMID:-nenhum})")"
+}
+
+# ============================================================================
 # Completion notice
 # ============================================================================
 print_complete() {
@@ -2746,6 +3125,10 @@ print_complete() {
 	fi
 	if [ -f "$CR_SO_PATH" ]; then
 		echo -e "    ${GREEN}•${NC} CloudRedirect ($(L "cloud saves" "cloud saves"))"
+	fi
+	if [ -n "$OPT_AUTHORIZED_STEAMID" ]; then
+		echo -e "    ${GREEN}•${NC} Security Gatekeeper ($(L "Authorized: ${OPT_AUTHORIZED_PERSONA:-User} (${OPT_AUTHORIZED_STEAMID})" "Autorizado: ${OPT_AUTHORIZED_PERSONA:-Usuário} (${OPT_AUTHORIZED_STEAMID})"))"
+		echo -e "      ${DIM}$(L "Clean accounts run 100% official Steam with native Valve Cloud." "Contas limpas rodam a Steam 100% oficial com nuvem nativa da Valve.")${NC}"
 	fi
 	local coverage_policy
 	coverage_policy="$(installed_coverage_policy)"
@@ -2803,6 +3186,9 @@ $(L "Options" "Opções"):
   --lumen-channel stable|beta
                $(L "Select the Lumen update channel (default: stable)." \
                   "Seleciona o canal de atualização do Lumen (padrão: stable).")
+  --authorized-steamid <id>
+               $(L "SteamID64 authorized to use LuaTools/SLSsteam (other accounts run clean)." \
+                  "SteamID64 autorizado a usar LuaTools/SLSsteam (outras contas rodam limpas).")
   -h, --help   $(L "Show this help and exit." "Mostra esta ajuda e sai.")
 EOF
 }
@@ -2846,10 +3232,24 @@ parse_args() {
 	OPT_SLS_CHANNEL="stable"
 	OPT_PLUGIN_CHANNEL="stable"
 	OPT_LUMEN_CHANNEL="stable"
+	OPT_AUTHORIZED_STEAMID=""
+	OPT_AUTHORIZED_PERSONA=""
+	OPT_AUTHORIZED_ACCOUNT=""
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--noplugin) OPT_NOPLUGIN=1 ;;
 			--nolaunch) OPT_NOLAUNCH=1 ;;
+			--authorized-steamid)
+				if [ "$#" -lt 2 ]; then
+					OPT_BAD_ARG="$1"
+					return 1
+				fi
+				OPT_AUTHORIZED_STEAMID="$2"
+				shift
+				;;
+			--authorized-steamid=*)
+				OPT_AUTHORIZED_STEAMID="${1#*=}"
+				;;
 			--slsteam-channel|--plugin-channel|--lumen-channel)
 				local option="$1"
 				if [ "$#" -lt 2 ]; then
@@ -2909,6 +3309,7 @@ main() {
 	# No privilege prompt is made on immutable systems.
 	preask_prompts
 	preask_launcher_sudo
+	[ -n "$OPT_AUTHORIZED_STEAMID" ] || preask_authorized_account
 
 	print_section "$(L "Stopping Steam" "Parando a Steam")"
 	stop_steam
@@ -2951,6 +3352,12 @@ main() {
 	# itself defaults to "no" on Enter — even with --noplugin.
 	print_section "$(L "Setting up cloud saves (CloudRedirect)" "Configurando cloud saves (CloudRedirect)")"
 	install_cloudredirect
+
+	# Install the security gatekeeper wrapper in front of Steam so only
+	# the authorized account loads modifications, while clean accounts
+	# run 100% untouched official Steam with native Valve Cloud saves.
+	print_section "$(L "Setting up Security Gatekeeper" "Configurando Gatekeeper de Segurança")"
+	install_gatekeeper
 
 	print_complete
 
