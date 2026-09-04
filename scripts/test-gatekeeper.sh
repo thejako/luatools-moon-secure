@@ -125,9 +125,13 @@ check "manage_stplugin restore: renames stplug-in.modded back to stplug-in" $?
 # Test 4: sanitize_env_for_clean
 # ----------------------------------------------------------------------------
 export LD_AUDIT="/some/path/SLSsteam.so"
+export LUMEN_BACKEND_DIR="/some/lumen/backend"
+export LUMEN_LUA_DIR="/some/lumen/lua"
 export LD_PRELOAD="/usr/lib/libother.so:/home/deck/.local/share/CloudRedirect/cloud_redirect.so"
 sanitize_env_for_clean
 [ -z "${LD_AUDIT:-}" ]; check "sanitize_env: unsets LD_AUDIT" $?
+[ -z "${LUMEN_BACKEND_DIR:-}" ]; check "sanitize_env: unsets LUMEN_BACKEND_DIR" $?
+[ -z "${LUMEN_LUA_DIR:-}" ]; check "sanitize_env: unsets LUMEN_LUA_DIR" $?
 [ "${LD_PRELOAD:-}" = "/usr/lib/libother.so" ]; check "sanitize_env: strips cloud_redirect.so from LD_PRELOAD" $?
 
 export LD_PRELOAD="/home/deck/.local/share/CloudRedirect/cloud_redirect.so"
@@ -143,37 +147,23 @@ MOCK_LOG="$TESTDIR/mock.log"
 
 RUNNER="${BASH:-$(command -v bash 2>/dev/null || command -v sh)}"
 
+# Create mock real steam binary
 REAL_STEAM_MOCK="$FAKE_BIN/real_steam"
-cat > "$REAL_STEAM_MOCK" << 'EOF'
+cat > "$REAL_STEAM_MOCK" << EOF
 #!/bin/sh
 echo "LAUNCHED_REAL_STEAM" > "$MOCK_LOG"
 EOF
-chmod +x "$REAL_STEAM_MOCK" 2>/dev/null || true
+chmod +x "$REAL_STEAM_MOCK"
 
-MODDED_WRAPPER_MOCK="$FAKE_BIN/modded_steam"
-cat > "$MODDED_WRAPPER_MOCK" << 'EOF'
+# Create mock modded wrapper
+MODDED_WRAPPER_MOCK="$FAKE_BIN/steam.modded"
+cat > "$MODDED_WRAPPER_MOCK" << EOF
 #!/bin/sh
 echo "LAUNCHED_MODDED_STEAM" > "$MOCK_LOG"
 EOF
-chmod +x "$MODDED_WRAPPER_MOCK" 2>/dev/null || true
+chmod +x "$MODDED_WRAPPER_MOCK"
 
-# Case A: Active user is authorized modded account -> launches modded steam
-cat > "$CFG" << 'EOF'
-{ "authorized_steamid": "76561198022222222" }
-EOF
-mkdir -p "$FAKE_STEAM/config"
-VDF="$FAKE_STEAM/config/loginusers.vdf"
-cat > "$VDF" << 'EOF'
-"users"
-{
-	"76561198022222222"
-	{
-		"MostRecent"		"1"
-	}
-}
-EOF
-rm -f "$MOCK_LOG"
-export MOCK_LOG
+# Case A: Active user matches authorized account -> launches modded wrapper
 GATEKEEPER_CONFIG_FILE="$CFG" \
 GATEKEEPER_STEAM_ROOT="$FAKE_STEAM" \
 GATEKEEPER_REAL_STEAM="$REAL_STEAM_MOCK" \
@@ -215,6 +205,62 @@ GATEKEEPER_LIB_ONLY=0 \
 
 [ "$(cat "$MOCK_LOG" 2>/dev/null)" = "LAUNCHED_REAL_STEAM" ]; check "e2e: missing vdf fails secure to real steam" $?
 
+# ----------------------------------------------------------------------------
+# Test 6: Gatekeeper Session Watcher (gatekeeper-watcher.sh)
+# ----------------------------------------------------------------------------
+WATCHER_SH="$SCRIPT_DIR/gatekeeper-watcher.sh"
+export WATCHER_LIB_ONLY=1
+# shellcheck disable=SC1090
+source "$WATCHER_SH"
+
+# Setup simulated Steam directory for watcher tests
+WATCHER_STEAM="$TESTDIR/watcher_steam"
+mkdir -p "$WATCHER_STEAM/config/stplug-in"
+echo "game_script" > "$WATCHER_STEAM/config/stplug-in/99999.lua"
+WATCHER_VDF="$WATCHER_STEAM/config/loginusers.vdf"
+
+# Subtest 6.1: Steam running in modded mode, unauthorized user logs in -> trigger clean transition
+cat > "$WATCHER_VDF" << 'EOF'
+"users" {
+	"76561198011111111" {
+		"MostRecent" "1"
+	}
+}
+EOF
+export GATEKEEPER_CONFIG_FILE="$CFG" # authorized_steamid is 76561198012345678
+export WATCHER_MOCK_STEAM_RUNNING=1
+export WATCHER_SKIP_RESTART_EXEC=1
+
+watch_step "$WATCHER_STEAM"
+w_res=$?
+[ "$w_res" -eq 1 ]; check "watcher: unauthorized login in modded session returns 1 (quarantine trigger)" $?
+[ ! -d "$WATCHER_STEAM/config/stplug-in" ] && [ -d "$WATCHER_STEAM/config/stplug-in.modded" ]
+check "watcher: hides stplug-in directory upon unauthorized login" $?
+
+# Subtest 6.2: Aligned clean state -> watch_step returns 0 (no-op)
+watch_step "$WATCHER_STEAM"
+w_res=$?
+[ "$w_res" -eq 0 ]; check "watcher: already-quarantined unauthorized session returns 0 (no-op)" $?
+
+# Subtest 6.3: Authorized user logs back in while in clean mode -> trigger modded transition
+cat > "$WATCHER_VDF" << 'EOF'
+"users" {
+	"76561198012345678" {
+		"MostRecent" "1"
+	}
+}
+EOF
+watch_step "$WATCHER_STEAM"
+w_res=$?
+[ "$w_res" -eq 2 ]; check "watcher: authorized login in clean session returns 2 (restore trigger)" $?
+[ -d "$WATCHER_STEAM/config/stplug-in" ] && [ ! -d "$WATCHER_STEAM/config/stplug-in.modded" ]
+check "watcher: restores stplug-in directory upon authorized login" $?
+
+# Subtest 6.4: Aligned modded state -> watch_step returns 0 (no-op)
+watch_step "$WATCHER_STEAM"
+w_res=$?
+[ "$w_res" -eq 0 ]; check "watcher: already-restored authorized session returns 0 (no-op)" $?
+
 if [ "$failures" -eq 0 ]; then
     echo
     echo "ALL PASS"
@@ -223,4 +269,3 @@ fi
 echo
 echo "$failures CHECK(S) FAILED"
 exit 1
-EOF

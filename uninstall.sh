@@ -1410,6 +1410,8 @@ uninstall_slsteam_moon() {
 	rm -f "$HOME/.SLSsteam.log" 2>/dev/null || true
 
 	# Gatekeeper security config and isolated stplug-in cleanup
+	pkill -f "gatekeeper-watcher" 2>/dev/null || true
+	rm -f "$HOME/.local/state/slsteam-moon/gatekeeper-watcher.pid" "$HOME/.local/share/SLSsteam/path/gatekeeper-watcher.sh" 2>/dev/null || true
 	rm -rf "$HOME/.config/luatools-secure" "$HOME/.local/share/SLSsteam-secure" 2>/dev/null || true
 	local _sr
 	for _sr in "$HOME/.steam/steam" "$HOME/.local/share/Steam" "$HOME/.steam/root" "$HOME/.steam/debian-installation"; do

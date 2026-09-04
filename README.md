@@ -48,6 +48,69 @@ Reference material:
 
 Open an issue: https://github.com/swwayps/luatools-moon/issues
 
+## Cloud Saves (CloudRedirect)
+
+[CloudRedirect](https://github.com/Selectively11/CloudRedirect) enables cloud save synchronization for added/unowned games by redirecting Steam Cloud calls to your personal cloud provider (**OneDrive** or **Google Drive**).
+
+During `install.sh`, if you enable CloudRedirect, the installer will ask if you also want to install the **CloudRedirect companion app (Flatpak)**.
+* **If you select YES**: The installer automatically deploys the Steam hook (`cloud_redirect.so`), installs the companion Flatpak app, and configures sandbox filesystem permissions so credentials sync seamlessly with Steam.
+* **If you select NO**: Only the core Steam hook (`cloud_redirect.so`) is deployed. To connect your cloud provider (OneDrive / Google Drive), you can install and configure the companion app manually at any time.
+
+### Manual Installation of the CloudRedirect Companion App
+
+If you chose not to install the companion app during setup, or need to reinstall it, run these commands in your terminal (Konsole on Steam Deck):
+
+```bash
+# 1. Ensure Flathub is added as a user remote
+flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
+# 2. Install the KDE Platform runtime required by the app (~400 MB)
+flatpak install --user -y flathub org.kde.Platform//6.10
+
+# 3. Download the official Flatpak bundle from GitHub releases
+curl -fL -o /tmp/cloudredirect.flatpak "https://github.com/Selectively11/CloudRedirect/releases/download/v2.6.5/cloudredirect.flatpak"
+
+# 4. Install the Flatpak bundle
+flatpak install --user -y --bundle /tmp/cloudredirect.flatpak
+
+# 5. Grant filesystem access so the Flatpak app shares ~/.config/CloudRedirect with Steam (prevents sync errors)
+flatpak override --user --filesystem=xdg-config/CloudRedirect org.cloudredirect.CloudRedirect
+
+# 6. Clean up temporary download
+rm -f /tmp/cloudredirect.flatpak
+```
+
+### Configuring OneDrive / Google Drive
+
+1. Open the application from the desktop Application Menu or run:
+   ```bash
+   flatpak run org.cloudredirect.CloudRedirect
+   ```
+2. In the app, navigate to the **Cloud Provider** tab.
+3. Select **OneDrive** (or Google Drive) from the dropdown.
+4. Click **Sign In**. Your browser will open the Microsoft authentication page.
+5. Log in with your Microsoft account and grant the requested permissions.
+6. Once signed in, the application will save your credentials to `~/.config/CloudRedirect/config.json`.
+7. Launch Steam. The CloudRedirect hook will load automatically and sync your saves with OneDrive.
+
+### Troubleshooting Sync Errors
+
+* **"Steam Cloud Error" on game launch/exit**:
+  * Verify that `DisableCloud` is set to `no` in `~/.config/SLSsteam/config.yaml`:
+    ```bash
+    grep "DisableCloud" ~/.config/SLSsteam/config.yaml
+    ```
+    If it is set to `yes`, change it to `no`.
+  * Ensure the Flatpak override is active so Steam and the app use the same config:
+    ```bash
+    flatpak override --user --filesystem=xdg-config/CloudRedirect org.cloudredirect.CloudRedirect
+    ```
+* **Inspect logs**:
+  ```bash
+  tail -n 50 ~/.config/CloudRedirect/cloud_redirect.log
+  tail -n 50 ~/.config/CloudRedirect/cr_debug.log
+  ```
+
 ## Test & Verify Installation
 
 Verify that all components (Steam environment, SLSsteam, Lumen, LuaTools plugin, Security Gatekeeper, and Account Isolation) are installed and functioning properly:

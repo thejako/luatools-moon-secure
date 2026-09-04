@@ -414,6 +414,13 @@ check_security_gatekeeper() {
 		                "Falta el wrapper modificado en ${modded}")"
 	fi
 
+	local watcher="$HOME/.local/share/SLSsteam/path/gatekeeper-watcher.sh"
+	if [ -f "$watcher" ] && [ -x "$watcher" ]; then
+		check_pass "$(L "Gatekeeper session watcher deployed at ${watcher}" \
+		                "Watcher de sessão do Gatekeeper instalado em ${watcher}" \
+		                "Vigilante de sesión del Gatekeeper instalado en ${watcher}")"
+	fi
+
 	# Active Account & Simulation
 	local vdf
 	vdf="$(find_loginusers_vdf || true)"
@@ -556,6 +563,19 @@ check_optionals() {
 		check_pass "$(L "CloudRedirect hook deployed at ${cr_so}" \
 		                "Hook do CloudRedirect instalado em ${cr_so}" \
 		                "Hook de CloudRedirect instalado en ${cr_so}")"
+		if command -v python3 >/dev/null 2>&1 && python3 -c "
+import sys
+try:
+    with open(sys.argv[1], 'rb') as f:
+        d = f.read()
+    sys.exit(0 if b'\x68\x22\x27\x00\x00\x56\xff\x97\x0c\x24\x00\x00\x83\xc4\x0c\x6a\x01\x6a\x34\x56' in d else 1)
+except Exception:
+    sys.exit(1)
+" "$cr_so" 2>/dev/null; then
+			check_pass "$(L "CloudRedirect hook: OneDrive 302 redirect fix active" \
+			                "Hook do CloudRedirect: correção de redirecionamento 302 do OneDrive ativa" \
+			                "Hook de CloudRedirect: corrección de redirecciones 302 de OneDrive activa")"
+		fi
 	else
 		check_info "$(L "CloudRedirect hook is not installed (optional cloud saves disabled)" \
 		                "Hook do CloudRedirect não está instalado (cloud saves opcionais desativados)" \

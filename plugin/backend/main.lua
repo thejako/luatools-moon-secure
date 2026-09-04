@@ -122,9 +122,32 @@ local function is_session_authorized()
     return false
 end
 
+local function quarantine_unauthorized_session()
+    local base = steam_utils.detect_steam_install_path()
+    if not base or base == "" then return end
+    local stplug = fs.join(base, "config", "stplug-in")
+    local stplug_modded = fs.join(base, "config", "stplug-in.modded")
+    if fs.exists(stplug) then
+        logger.warn("Security: Unauthorized Steam session active in Lumen. Hiding stplug-in directory.")
+        pcall(function()
+            os.execute(string.format("mv '%s' '%s' 2>/dev/null", stplug, stplug_modded))
+        end)
+    end
+    local home = os.getenv("HOME") or ""
+    local watcher = home .. "/.local/share/SLSsteam/path/gatekeeper-watcher.sh"
+    if fs.exists(watcher) then
+        pcall(function()
+            os.execute(string.format("'%s' --trigger-clean >/dev/null 2>&1 &", watcher))
+        end)
+    end
+end
+
 function GetSecurityStatus()
     local cfg = get_security_config()
     local is_auth = is_session_authorized()
+    if cfg and cfg.authorized_steamid and cfg.authorized_steamid ~= "" and not is_auth then
+        pcall(quarantine_unauthorized_session)
+    end
     return json_ok({
         success = true,
         security_enabled = (cfg ~= nil and cfg.authorized_steamid ~= nil and cfg.authorized_steamid ~= ""),
@@ -274,6 +297,9 @@ function RestartSteam()
 end
 
 function HasLuaToolsForApp(appid)
+    if not is_session_authorized() then
+        return json_ok({ success = true, exists = false })
+    end
     if type(appid) == "table" then appid = appid.appid end
     local ok, exists = pcall(steam_utils.has_lua_for_app, tonumber(appid))
     if not ok then return json_err(exists) end

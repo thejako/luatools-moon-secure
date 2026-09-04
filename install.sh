@@ -168,12 +168,12 @@ print_section() {
 # ("y" or "n", defaults to "y"). With no controlling terminal (CI / truly
 # non-interactive) it returns the default instead of blocking forever.
 prompt_yes_no() {
-	local q_en="$1" q_pt="$2" def="${3:-y}" prompt hint ans
-	prompt="$(L "$q_en" "$q_pt")"
+	local q_en="$1" q_pt="$2" def="${3:-y}" q_es="${4:-}" prompt hint ans
+	prompt="$(L "$q_en" "$q_pt" "$q_es")"
 	if [ "$def" = "y" ]; then
-		hint="$(L "[Y/n]" "[S/n]")"
+		hint="$(L "[Y/n]" "[S/n]" "[S/n]")"
 	else
-		hint="$(L "[y/N]" "[s/N]")"
+		hint="$(L "[y/N]" "[s/N]" "[s/N]")"
 	fi
 
 	# No usable terminal → don't hang; honour the default.
@@ -191,7 +191,8 @@ prompt_yes_no() {
 			y*|s*)    return 0 ;;
 			n*)       return 1 ;;
 			*) echo "$(L "Please answer y (yes) or n (no)." \
-			            "Responda s (sim) ou n (não).")" >/dev/tty ;;
+			            "Responda s (sim) ou n (não)." \
+			            "Por favor responde s (sí) o n (no).")" >/dev/tty ;;
 		esac
 	done
 }
@@ -208,24 +209,30 @@ prompt_yes_no() {
 # inline sites can't drift apart.
 Q_CLOUD_EN="Do you want Steam Cloud saves to work for your games? This installs CloudRedirect, which syncs your saves to your own cloud (Google Drive / OneDrive). Say no if you don't need cloud saves."
 Q_CLOUD_PT="Você quer que os saves da Steam Cloud funcionem nos seus jogos? Isso instala o CloudRedirect, que sincroniza seus saves na sua própria nuvem (Google Drive / OneDrive). Responda não se você não precisa de cloud saves."
+Q_CLOUD_ES="¿Quieres que los guardados de Steam Cloud funcionen en tus juegos? Esto instala CloudRedirect, que sincroniza tus partidas en tu propia nube (Google Drive / OneDrive). Responde no si no necesitas guardado en la nube."
+Q_CLOUD_APP_EN="Do you also want to install the CloudRedirect companion app (Flatpak)? This provides a desktop GUI to sign in to your cloud provider (OneDrive / Google Drive)."
+Q_CLOUD_APP_PT="Você também deseja instalar o app companheiro do CloudRedirect (Flatpak)? Ele fornece uma interface gráfica para fazer login no seu provedor de nuvem (OneDrive / Google Drive)."
+Q_CLOUD_APP_ES="¿Deseas instalar también la aplicación complementaria de CloudRedirect (Flatpak)? Proporciona una interfaz gráfica para iniciar sesión en tu proveedor de nube (OneDrive / Google Drive)."
 Q_GAMEMODE_EN="Enable the plugin in Game Mode too? This changes how Steam is launched in Gaming Mode (reversible by the uninstaller)."
 Q_GAMEMODE_PT="Ativar o plugin também no Game Mode? Isso altera como a Steam é iniciada no modo Gaming (reversível pelo desinstalador)."
+Q_GAMEMODE_ES="¿Habilitar el plugin también en Modo Juego? Esto modifica cómo se inicia Steam en Gaming Mode (reversible mediante el desinstalador)."
 
 # Cached answers (empty = not asked yet). Populated by preask_prompts.
 PREASK_CLOUD=""
+PREASK_CLOUD_APP=""
 PREASK_GAMEMODE=""
 
-# resolve_yesno CACHE_VAR "q_en" "q_pt" def -> 0 (yes) / 1 (no).
+# resolve_yesno CACHE_VAR "q_en" "q_pt" def [q_es] -> 0 (yes) / 1 (no).
 # Uses a previously cached y/n answer (by variable name) if present; otherwise
 # prompts now and stores the answer so a later call is consistent.
 resolve_yesno() {
 	local -n __cache="$1"
-	local q_en="$2" q_pt="$3" def="$4"
+	local q_en="$2" q_pt="$3" def="$4" q_es="${5:-}"
 	case "$__cache" in
 		y) return 0 ;;
 		n) return 1 ;;
 	esac
-	if prompt_yes_no "$q_en" "$q_pt" "$def"; then __cache="y"; return 0; fi
+	if prompt_yes_no "$q_en" "$q_pt" "$def" "$q_es"; then __cache="y"; return 0; fi
 	__cache="n"; return 1
 }
 
@@ -238,18 +245,22 @@ preask_prompts() {
 	{ [ -e /dev/tty ] && { : >/dev/tty; } 2>/dev/null; } || return 0
 
 	print_section "$(L "A couple of questions (answer now, before Steam closes)" \
-	                   "Algumas perguntas (responda agora, antes de a Steam fechar)")"
+	                   "Algumas perguntas (responda agora, antes de a Steam fechar)" \
+	                   "Un par de preguntas (responde ahora, antes de cerrar Steam)")"
 	log_info "$(L "On Steam Deck / SteamOS the on-screen keyboard needs Steam open, so we ask these before stopping it." \
-	             "No Steam Deck / SteamOS o teclado virtual precisa da Steam aberta, então perguntamos isto antes de fechá-la.")"
+	             "No Steam Deck / SteamOS o teclado virtual precisa da Steam aberta, então perguntamos isto antes de fechá-la." \
+	             "En Steam Deck / SteamOS el teclado en pantalla necesita que Steam esté abierto, por lo que preguntamos antes de cerrarlo.")"
 
 	# Game Mode question only when a gamescope session exists on this host.
 	if has_gamescope_session; then
-		resolve_yesno PREASK_GAMEMODE "$Q_GAMEMODE_EN" "$Q_GAMEMODE_PT" "n" || true
+		resolve_yesno PREASK_GAMEMODE "$Q_GAMEMODE_EN" "$Q_GAMEMODE_PT" "n" "$Q_GAMEMODE_ES" || true
 	fi
 	# Cloud-save question only when the hook isn't deployed yet. An existing
 	# install is kept current silently, so asking again would be noise.
 	if ! cloudredirect_installed; then
-		resolve_yesno PREASK_CLOUD "$Q_CLOUD_EN" "$Q_CLOUD_PT" "n" || true
+		if resolve_yesno PREASK_CLOUD "$Q_CLOUD_EN" "$Q_CLOUD_PT" "n" "$Q_CLOUD_ES"; then
+			resolve_yesno PREASK_CLOUD_APP "$Q_CLOUD_APP_EN" "$Q_CLOUD_APP_PT" "y" "$Q_CLOUD_APP_ES" || true
+		fi
 	fi
 	preask_authorized_account
 }
@@ -1390,6 +1401,7 @@ stop_lumen() {
 	# Last resort: SIGKILL.
 	pkill -KILL -f "$lumen_bin" 2>/dev/null || true
 	sleep 1
+	pkill -f "gatekeeper-watcher" 2>/dev/null || true
 	log_success "$(L "Lumen stopped" "Lumen parado")"
 }
 
@@ -2377,6 +2389,57 @@ cr_hook_is_current() {
 	[ "$published" = "$stored" ]
 }
 
+# Patch CURLOPT_FOLLOWLOCATION (0L -> 1L) to fix personal OneDrive 302 redirect chain.
+# The Microsoft Graph API redirects to the OneDrive CDN, which redirects a second time
+# to Azure Blob Storage. Without FOLLOWLOCATION=1, curl stops at the second 302 and fails.
+# Idempotent: safe to run on unpatched or already-patched binaries.
+patch_cloudredirect_so() {
+	local target="$1"
+	[ -f "$target" ] || return 0
+
+	# Pattern in 32-bit x86:
+	# CURLOPT_USERAGENT (0x2722) ... CURLOPT_FOLLOWLOCATION (0x34) with push 0 (6a 00)
+	# Replaces: 68 22 27 00 00 56 ff 97 0c 24 00 00 83 c4 0c 6a 00 6a 34 56
+	#     with: 68 22 27 00 00 56 ff 97 0c 24 00 00 83 c4 0c 6a 01 6a 34 56
+	if command -v python3 >/dev/null 2>&1; then
+		python3 - "$target" <<-'EOF' 2>/dev/null || true
+			import sys
+			path = sys.argv[1]
+			try:
+			    with open(path, 'rb') as f:
+			        data = bytearray(f.read())
+			    old = b'\x68\x22\x27\x00\x00\x56\xff\x97\x0c\x24\x00\x00\x83\xc4\x0c\x6a\x00\x6a\x34\x56'
+			    new = b'\x68\x22\x27\x00\x00\x56\xff\x97\x0c\x24\x00\x00\x83\xc4\x0c\x6a\x01\x6a\x34\x56'
+			    if old in data:
+			        data = data.replace(old, new, 1)
+			        with open(path, 'wb') as f:
+			            f.write(data)
+			except Exception:
+			    pass
+		EOF
+	elif command -v perl >/dev/null 2>&1; then
+		perl -0777 -pi -e 's/\x68\x22\x27\x00\x00\x56\xff\x97\x0c\x24\x00\x00\x83\xc4\x0c\x6a\x00\x6a\x34\x56/\x68\x22\x27\x00\x00\x56\xff\x97\x0c\x24\x00\x00\x83\xc4\x0c\x6a\x01\x6a\x34\x56/s' "$target" 2>/dev/null || true
+	fi
+}
+
+# Ensure standard Steam 32-bit SDK symlinks exist so loaders and hooks can locate
+# steamclient.so even before Steam has mapped it into memory.
+ensure_steam_sdk_symlinks() {
+	local steam_dir=""
+	for d in "$HOME/.local/share/Steam" "$HOME/.steam/steam" "$HOME/.steam/root"; do
+		if [ -f "$d/ubuntu12_32/steamclient.so" ]; then
+			steam_dir="$d"
+			break
+		fi
+	done
+	[ -n "$steam_dir" ] || return 0
+
+	mkdir -p "$HOME/.steam/sdk32" 2>/dev/null || true
+	if [ ! -e "$HOME/.steam/sdk32/steamclient.so" ]; then
+		ln -snf "$steam_dir/ubuntu12_32/steamclient.so" "$HOME/.steam/sdk32/steamclient.so" 2>/dev/null || true
+	fi
+}
+
 # Deploy the patched 32-bit cloud_redirect.so from the cloudredirect-moon repo
 # into ~/.local/share/CloudRedirect. No-op (beyond the download) when the
 # published hook is byte-identical to the deployed one.
@@ -2403,6 +2466,9 @@ install_cloudredirect_so() {
 		             "cloud_redirect.so baixado não é 32-bit; pulando cloud saves.")"
 		return 1
 	fi
+
+	# Patch CURLOPT_FOLLOWLOCATION (0L -> 1L) to support OneDrive 302 redirect chain
+	patch_cloudredirect_so "$so"
 
 	mkdir -p "$CR_DIR"
 
@@ -2597,32 +2663,40 @@ flatpak_tty() {
 install_cloudredirect_flatpak() {
 	local url tmp bundle
 
-	# Already installed? Nothing to do.
+	# Already installed? Ensure filesystem override is active.
 	if flatpak list 2>/dev/null | grep -q "$CR_FLATPAK_APP_ID"; then
-		log_success "$(L "CloudRedirect app already installed" "App CloudRedirect já instalado")"
+		flatpak override --user --filesystem=xdg-config/CloudRedirect "$CR_FLATPAK_APP_ID" >/dev/null 2>&1 || true
+		log_success "$(L "CloudRedirect app already installed" \
+		             "App CloudRedirect já instalado" \
+		             "App CloudRedirect ya instalada")"
 		CR_FLATPAK_INSTALLED=1
 		return 0
 	fi
 
 	log_info "$(L "Resolving CloudRedirect companion app (flatpak)" \
-	             "Buscando o app companheiro do CloudRedirect (flatpak)")"
+	             "Buscando o app companheiro do CloudRedirect (flatpak)" \
+	             "Buscando la aplicación complementaria de CloudRedirect (flatpak)")"
 	# The newest CloudRedirect tag may ship no flatpak (e.g. 2.1.7), and recent
 	# ones name it cloudredirect-<ver>.flatpak rather than cloudredirect.flatpak.
 	# Scan all releases for the first matching bundle, excluding .sha256 sidecars.
 	url="$(any_release_asset_url "$CR_REPO" "^cloudredirect.*\\.flatpak$" github)"
 	if [ -z "$url" ]; then
 		log_warn "$(L "Could not find the CloudRedirect flatpak bundle; skipping the login app." \
-		             "Não foi possível encontrar o bundle flatpak do CloudRedirect; pulando o app de login.")"
+		             "Não foi possível encontrar o bundle flatpak do CloudRedirect; pulando o app de login." \
+		             "No se pudo encontrar el paquete flatpak de CloudRedirect; omitiendo la aplicación.")"
 		return 1
 	fi
 
 	tmp="$(mktemp -d)"; trap 'rm -rf "${tmp:-}"' RETURN
 	bundle="$tmp/$(basename "$url")"
 
-	log_info "$(L "Downloading CloudRedirect app" "Baixando o app CloudRedirect")"
+	log_info "$(L "Downloading CloudRedirect app" \
+	             "Baixando o app CloudRedirect" \
+	             "Descargando la app CloudRedirect")"
 	if ! curl -fL "$url" -o "$bundle"; then
 		log_warn "$(L "Download of the CloudRedirect app failed; you can install it later." \
-		             "Falha ao baixar o app CloudRedirect; você pode instalá-lo depois.")"
+		             "Falha ao baixar o app CloudRedirect; você pode instalá-lo depois." \
+		             "Error al descargar la app CloudRedirect; puedes instalarla más tarde.")"
 		return 1
 	fi
 
@@ -2638,18 +2712,37 @@ install_cloudredirect_flatpak() {
 	# cursor-position probes are answered by the terminal, not leaked as stray
 	# escape sequences (see flatpak_tty).
 	log_info "$(L "Installing KDE runtime (required by the app, ~400 MB)" \
-	             "Instalando o runtime KDE (exigido pelo app, ~400 MB)")"
+	             "Instalando o runtime KDE (exigido pelo app, ~400 MB)" \
+	             "Instalando el runtime de KDE (requerido por la aplicación, ~400 MB)")"
 	flatpak_tty install --user -y flathub "$CR_KDE_RUNTIME" || true
 
-	log_info "$(L "Installing the CloudRedirect app" "Instalando o app CloudRedirect")"
+	log_info "$(L "Installing the CloudRedirect app" \
+	             "Instalando o app CloudRedirect" \
+	             "Instalando la aplicación CloudRedirect")"
 	if flatpak_tty install --user -y --bundle "$bundle"; then
-		log_success "$(L "CloudRedirect app installed" "App CloudRedirect instalado")"
+		flatpak override --user --filesystem=xdg-config/CloudRedirect "$CR_FLATPAK_APP_ID" >/dev/null 2>&1 || true
+		# Migrate existing sandbox configuration and tokens to host if present
+		local flatpak_dir="$HOME/.var/app/$CR_FLATPAK_APP_ID/config/CloudRedirect"
+		local host_dir="$HOME/.config/CloudRedirect"
+		if [ -d "$flatpak_dir" ]; then
+			mkdir -p "$host_dir" 2>/dev/null || true
+			if [ -f "$flatpak_dir/config.json" ] && { [ ! -f "$host_dir/config.json" ] || grep -q '"provider"[[:space:]]*:[[:space:]]*"local"' "$host_dir/config.json" 2>/dev/null; }; then
+				cp -f "$flatpak_dir/config.json" "$host_dir/config.json" 2>/dev/null || true
+			fi
+			for tok in "$flatpak_dir"/tokens_*.json; do
+				[ -f "$tok" ] && cp -f "$tok" "$host_dir/" 2>/dev/null || true
+			done
+		fi
+		log_success "$(L "CloudRedirect app installed" \
+		             "App CloudRedirect instalado" \
+		             "Aplicación CloudRedirect instalada")"
 		CR_FLATPAK_INSTALLED=1
 		return 0
 	fi
 
 	log_warn "$(L "Could not install the CloudRedirect app automatically; you can install it later." \
-	             "Não foi possível instalar o app CloudRedirect automaticamente; você pode instalá-lo depois.")"
+	             "Não foi possível instalar o app CloudRedirect automaticamente; você pode instalá-lo depois." \
+	             "No se pudo instalar la app CloudRedirect automáticamente; puedes instalarla más tarde.")"
 	return 1
 }
 
@@ -2670,12 +2763,16 @@ install_cloudredirect() {
 	# published build differs from the deployed one, and do nothing when it
 	# doesn't.
 	if cloudredirect_installed; then
+		patch_cloudredirect_so "$CR_SO_PATH"
+		ensure_steam_sdk_symlinks
 		if cr_hook_is_current; then
 			log_info "$(L "CloudRedirect is installed and up to date." \
-			             "CloudRedirect está instalado e atualizado.")"
+			             "CloudRedirect está instalado e atualizado." \
+			             "CloudRedirect está instalado y actualizado.")"
 		else
 			log_info "$(L "CloudRedirect is installed; checking for an update." \
-			             "CloudRedirect está instalado; verificando atualização.")"
+			             "CloudRedirect está instalado; verificando atualização." \
+			             "CloudRedirect está instalado; comprobando actualización.")"
 			if install_cloudredirect_so; then
 				# Only worth scanning for the legacy CAS layout after the hook
 				# changed; the find over compatdata is slow on big libraries.
@@ -2686,16 +2783,27 @@ install_cloudredirect() {
 		# cloud RPCs — run on both paths.
 		sync_cloud_config_with_hook
 		ensure_cloudredirect_config
+		if command -v flatpak >/dev/null 2>&1 && flatpak list 2>/dev/null | grep -q "$CR_FLATPAK_APP_ID"; then
+			CR_FLATPAK_INSTALLED=1
+			flatpak override --user --filesystem=xdg-config/CloudRedirect "$CR_FLATPAK_APP_ID" >/dev/null 2>&1 || true
+			local flatpak_dir="$HOME/.var/app/$CR_FLATPAK_APP_ID/config/CloudRedirect"
+			local host_dir="$HOME/.config/CloudRedirect"
+			if [ -d "$flatpak_dir" ]; then
+				for tok in "$flatpak_dir"/tokens_*.json; do
+					[ -f "$tok" ] && [ ! -f "$host_dir/$(basename "$tok")" ] && cp -f "$tok" "$host_dir/" 2>/dev/null || true
+				done
+			fi
+		fi
 		return 0
 	fi
 
 	# Not installed yet. Cloud saves are optional, so ask first. CloudRedirect
 	# (the .so hook) only matters to people who want Steam Cloud saves to work
-	# for these games; skip the whole step if they say no. Sign-in now lives in
-	# Lumen Settings → Cloud Saves (no flatpak login app on the main line).
-	if ! resolve_yesno PREASK_CLOUD "$Q_CLOUD_EN" "$Q_CLOUD_PT" "n"; then
+	# for these games; skip the whole step if they say no.
+	if ! resolve_yesno PREASK_CLOUD "$Q_CLOUD_EN" "$Q_CLOUD_PT" "n" "$Q_CLOUD_ES"; then
 		log_info "$(L "Skipping cloud saves (CloudRedirect)." \
-		             "Pulando os cloud saves (CloudRedirect).")"
+		             "Pulando os cloud saves (CloudRedirect)." \
+		             "Omitiendo el guardado en la nube (CloudRedirect).")"
 		# Match the config to the hook's real state: if no hook is present,
 		# disable Steam Cloud for the added games so they don't trigger a
 		# rejected sync / "Steam Cloud Error". (A hook left over from a
@@ -2712,15 +2820,31 @@ install_cloudredirect() {
 		return 0
 	fi
 
+	ensure_steam_sdk_symlinks
 	set_disable_cloud no
 
 	# Start the hook in a defined local-only state; the user picks a provider
-	# and signs in from Lumen Settings → Cloud Saves.
+	# and signs in from the companion app or Lumen Settings.
 	ensure_cloudredirect_config
 
 	# Heal any saves left in the legacy CAS-corrupt directory layout so Steam
 	# stops reporting "Steam Cloud Error" for them.
 	repair_cas_save_layout
+
+	# Ask whether to install the full companion package (Flatpak app) to configure cloud providers
+	if resolve_yesno PREASK_CLOUD_APP "$Q_CLOUD_APP_EN" "$Q_CLOUD_APP_PT" "y" "$Q_CLOUD_APP_ES"; then
+		if command -v flatpak >/dev/null 2>&1; then
+			install_cloudredirect_flatpak || true
+		else
+			log_warn "$(L "flatpak is not installed; skipping companion app." \
+			             "flatpak não está instalado; pulando app companheiro." \
+			             "flatpak no está instalado; omitiendo la aplicación complementaria.")"
+		fi
+	else
+		log_info "$(L "Skipping CloudRedirect companion app (flatpak)." \
+		             "Pulando app companheiro do CloudRedirect (flatpak)." \
+		             "Omitiendo la aplicación complementaria de CloudRedirect (flatpak).")"
+	fi
 }
 
 # Read the coverage policy persisted by slsteam-moon. Older installs may not
@@ -2851,9 +2975,18 @@ preask_authorized_account() {
 	fi
 
 	local default_idx=1
+	local existing_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/luatools-secure/config.json"
+	local existing_auth=""
+	if [ -f "$existing_cfg" ]; then
+		existing_auth="$(get_authorized_steamid "$existing_cfg" || true)"
+	fi
+
 	local i
 	for ((i=0; i<count; i++)); do
-		if [ "${recents[$i]}" = "1" ]; then
+		if [ -n "$existing_auth" ] && [ "${ids[$i]}" = "$existing_auth" ]; then
+			default_idx=$((i + 1))
+			break
+		elif [ -z "$existing_auth" ] && [ "${recents[$i]}" = "1" ]; then
 			default_idx=$((i + 1))
 			break
 		fi
@@ -3122,12 +3255,15 @@ manage_stplugin() {
 
 sanitize_env_for_clean() {
     unset LD_AUDIT
+    unset LUMEN_BACKEND_DIR
+    unset LUMEN_LUA_DIR
+    pkill -f "$HOME/.local/share/Lumen/lumen" 2>/dev/null || true
     if [ -n "${LD_PRELOAD:-}" ]; then
         local new_preload=""
         local IFS=': '
         for item in $LD_PRELOAD; do
             case "$item" in
-                *cloud_redirect.so*) ;;
+                *cloud_redirect.so*|*SLSsteam*|*library-inject*) ;;
                 *) new_preload="${new_preload:+$new_preload:}$item" ;;
             esac
         done
@@ -3137,6 +3273,23 @@ sanitize_env_for_clean() {
             unset LD_PRELOAD
         fi
     fi
+}
+
+spawn_watcher_if_needed() {
+    local watcher_candidates=(
+        "${GATEKEEPER_WATCHER_BIN:-}"
+        "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/gatekeeper-watcher.sh"
+        "$HOME/.local/share/SLSsteam/path/gatekeeper-watcher.sh"
+    )
+    for w in "${watcher_candidates[@]}"; do
+        if [ -n "$w" ] && [ -x "$w" ]; then
+            "$w" --ensure >/dev/null 2>&1 &
+            return 0
+        elif [ -n "$w" ] && [ -f "$w" ]; then
+            bash "$w" --ensure >/dev/null 2>&1 &
+            return 0
+        fi
+    done
 }
 
 main() {
@@ -3154,7 +3307,13 @@ main() {
     local real_steam
     real_steam="$(find_real_steam)"
 
+    local wrapper="${GATEKEEPER_WRAPPER_BIN:-$HOME/.local/share/SLSsteam/path/steam}"
+    export STEAMSCRIPT="$wrapper"
+
     log_gatekeeper "INSPECT: root=${steam_root} vdf=${vdf} (exists: $([ -f "$vdf" ] && echo yes || echo no))"
+
+    # Always ensure the real-time session watcher is active
+    spawn_watcher_if_needed
 
     if [ -n "$authorized_id" ] && [ -n "$active_id" ] && [ "$active_id" = "$authorized_id" ]; then
         log_gatekeeper "AUTHORIZED: active_id=${active_id} matches authorized_id=${authorized_id} -> starting modded Steam"
@@ -3182,10 +3341,386 @@ fi
 EOF
 }
 
+watcher_script_content() {
+	cat << 'EOF'
+#!/usr/bin/env bash
+# ============================================================================
+#  luatools-moon-secure — Gatekeeper Session Watcher
+# ============================================================================
+#  Monitors Steam user session transitions in real time:
+#    - When an unauthorized (clean) user logs in:
+#        * Hides config/stplug-in -> config/stplug-in.modded immediately.
+#        * Terminates Lumen sidecar.
+#        * Relaunches Steam cleanly (free of LD_AUDIT / LD_PRELOAD / CloudRedirect).
+#    - When the authorized user logs back in:
+#        * Restores config/stplug-in.modded -> config/stplug-in.
+#        * Relaunches Steam with modded hooks (SLSsteam + CloudRedirect + Lumen).
+# ============================================================================
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATEKEEPER_SH="${SCRIPT_DIR}/gatekeeper.sh"
+
+if [ -f "$GATEKEEPER_SH" ]; then
+    GATEKEEPER_LIB_ONLY=1
+    # shellcheck disable=SC1090
+    . "$GATEKEEPER_SH"
+fi
+
+GATEKEEPER_CONFIG="${GATEKEEPER_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/luatools-secure/config.json}"
+MODDED_WRAPPER="${GATEKEEPER_MODDED_WRAPPER:-$HOME/.local/share/SLSsteam/path/steam.modded}"
+GATEKEEPER_WRAPPER="${GATEKEEPER_WRAPPER_BIN:-$HOME/.local/share/SLSsteam/path/steam}"
+WATCHER_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/slsteam-moon"
+WATCHER_PIDFILE="${WATCHER_STATE_DIR}/gatekeeper-watcher.pid"
+WATCHER_LOGFILE="${WATCHER_STATE_DIR}/gatekeeper.log"
+
+log_watcher() {
+    mkdir -p "$WATCHER_STATE_DIR" 2>/dev/null || true
+    printf '%s [WATCHER] %s\n' "$(date '+%F %T' 2>/dev/null || date)" "$1" >> "$WATCHER_LOGFILE" 2>/dev/null || true
+}
+
+if ! declare -f find_steam_root >/dev/null 2>&1; then
+find_steam_root() {
+    if [ -n "${GATEKEEPER_STEAM_ROOT:-}" ] && [ -d "$GATEKEEPER_STEAM_ROOT" ]; then
+        printf '%s' "$GATEKEEPER_STEAM_ROOT"
+        return 0
+    fi
+    local candidates=(
+        "$HOME/.steam/steam"
+        "$HOME/.local/share/Steam"
+        "$HOME/.steam/root"
+        "$HOME/.steam/debian-installation"
+    )
+    for c in "${candidates[@]}"; do
+        if [ -f "$c/config/loginusers.vdf" ]; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
+    local deep
+    deep="$(find "$HOME/.steam" "$HOME/.local/share/Steam" -maxdepth 3 -name "loginusers.vdf" -type f 2>/dev/null | head -n1)"
+    if [ -n "$deep" ] && [ -f "$deep" ]; then
+        dirname "$(dirname "$deep")"
+        return 0
+    fi
+    for c in "${candidates[@]}"; do
+        if [ -d "$c/config" ]; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
+    printf '%s' "$HOME/.local/share/Steam"
+}
+fi
+
+if ! declare -f get_authorized_steamid >/dev/null 2>&1; then
+get_authorized_steamid() {
+    local cfg="$1"
+    [ -f "$cfg" ] || return 1
+    local res=""
+    if command -v jq >/dev/null 2>&1; then
+        res="$(jq -r '.authorized_steamid // empty' "$cfg" 2>/dev/null)"
+    else
+        res="$(sed -n 's/.*"authorized_steamid"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' "$cfg" 2>/dev/null | head -n1)"
+    fi
+    res="$(printf '%s' "$res" | tr -d '\r[:space:]')"
+    [ -n "$res" ] || return 1
+    printf '%s' "$res"
+}
+fi
+
+if ! declare -f get_active_steamid >/dev/null 2>&1; then
+get_active_steamid() {
+    local vdf="$1"
+    [ -f "$vdf" ] || return 1
+    local res
+    res="$(awk '
+        /^[[:space:]]*"[0-9]+"/ {
+            current_id = $1
+            gsub(/[\r"]/, "", current_id)
+            count++
+            if (first_id == "") first_id = current_id
+        }
+        tolower($0) ~ /"mostrecent"[[:space:]]+"?1"?/ {
+            active_id = current_id
+        }
+        tolower($0) ~ /"timestamp"/ {
+            ts = $0
+            sub(/^[[:space:]]*"[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp]"[[:space:]]+"?[^0-9]*/, "", ts)
+            sub(/[^0-9].*$/, "", ts)
+            if (ts + 0 > max_ts) {
+                max_ts = ts + 0
+                latest_id = current_id
+            }
+        }
+        END {
+            if (active_id != "") {
+                print active_id
+            } else if (latest_id != "") {
+                print latest_id
+            } else if (count == 1) {
+                print first_id
+            }
+        }
+    ' "$vdf" 2>/dev/null | tr -d '\r[:space:]')"
+    [ -n "$res" ] || return 1
+    printf '%s' "$res"
+}
+fi
+
+if ! declare -f manage_stplugin >/dev/null 2>&1; then
+manage_stplugin() {
+    local mode="$1"
+    local steam_root="$2"
+    local config_dir="$steam_root/config"
+    local active_dir="$config_dir/stplug-in"
+    local modded_dir="$config_dir/stplug-in.modded"
+
+    mkdir -p "$config_dir" 2>/dev/null || true
+
+    if [ "$mode" = "hide" ]; then
+        if [ -d "$active_dir" ] && [ ! -L "$active_dir" ]; then
+            if [ -d "$modded_dir" ]; then
+                rm -rf "$modded_dir.bak" 2>/dev/null || true
+                mv "$modded_dir" "$modded_dir.bak" 2>/dev/null || true
+            fi
+            mv "$active_dir" "$modded_dir" 2>/dev/null || true
+        fi
+    elif [ "$mode" = "restore" ]; then
+        if [ -d "$modded_dir" ] && [ ! -d "$active_dir" ]; then
+            mv "$modded_dir" "$active_dir" 2>/dev/null || true
+        elif [ ! -d "$active_dir" ]; then
+            mkdir -p "$active_dir" 2>/dev/null || true
+        fi
+    fi
+}
+fi
+
+if ! declare -f find_real_steam >/dev/null 2>&1; then
+find_real_steam() {
+    if [ -n "${GATEKEEPER_REAL_STEAM:-}" ] && [ -x "$GATEKEEPER_REAL_STEAM" ]; then
+        printf '%s' "$GATEKEEPER_REAL_STEAM"
+        return 0
+    fi
+    for candidate in /usr/bin/steam /usr/games/steam /usr/local/bin/steam; do
+        if [ -x "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    printf '%s' "steam"
+}
+fi
+
+is_steam_running() {
+    if [ -n "${WATCHER_MOCK_STEAM_RUNNING:-}" ]; then
+        [ "$WATCHER_MOCK_STEAM_RUNNING" = "1" ]
+        return $?
+    fi
+    pgrep -x steam >/dev/null 2>&1 || \
+    pgrep -f "/steam.sh" >/dev/null 2>&1 || \
+    pgrep -f "ubuntu12_32/steam" >/dev/null 2>&1
+}
+
+get_current_session_mode() {
+    local steam_root="$1"
+    if [ -d "$steam_root/config/stplug-in" ]; then
+        printf 'modded'
+    elif [ -d "$steam_root/config/stplug-in.modded" ]; then
+        printf 'clean'
+    else
+        printf 'clean'
+    fi
+}
+
+restart_steam() {
+    local target_mode="$1"
+    local steam_root="$2"
+    local real_steam="$3"
+    local wrapper="$GATEKEEPER_WRAPPER"
+
+    log_watcher "ACTION: Restarting Steam to switch mode -> ${target_mode}"
+
+    if [ "$target_mode" = "clean" ]; then
+        pkill -f "$HOME/.local/share/Lumen/lumen" 2>/dev/null || true
+    fi
+
+    if [ "${WATCHER_SKIP_RESTART_EXEC:-0}" = 1 ]; then
+        log_watcher "ACTION (dry-run/test): Skipped actual process kill and restart"
+        return 0
+    fi
+
+    local in_gamemode=0
+    if [ "${XDG_CURRENT_DESKTOP:-}" = "gamescope" ] || [ -n "${STEAMOS_GAMEMODE:-}" ] || pgrep -x gamescope >/dev/null 2>&1; then
+        in_gamemode=1
+    fi
+
+    if [ -x "$real_steam" ]; then
+        "$real_steam" -shutdown >/dev/null 2>&1 || true
+    fi
+
+    local waited=0
+    while is_steam_running && [ "$waited" -lt 6 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if is_steam_running; then
+        log_watcher "WARN: Steam did not exit within timeout, sending SIGTERM"
+        pkill -TERM -x steam 2>/dev/null || true
+        sleep 2
+    fi
+
+    if is_steam_running; then
+        log_watcher "WARN: Steam still running after SIGTERM, sending SIGKILL"
+        pkill -KILL -x steam 2>/dev/null || true
+        sleep 1
+    fi
+
+    if [ "$in_gamemode" -eq 1 ]; then
+        log_watcher "Game Mode active: SteamOS session supervisor will relaunch Steam automatically via Gatekeeper"
+        return 0
+    fi
+
+    log_watcher "Desktop Mode active: relaunching Steam via ${wrapper}"
+    if [ -x "$wrapper" ]; then
+        nohup "$wrapper" >/dev/null 2>&1 < /dev/null &
+    elif [ -x "$real_steam" ]; then
+        nohup "$real_steam" >/dev/null 2>&1 < /dev/null &
+    fi
+}
+
+watch_step() {
+    local steam_root="${1:-$(find_steam_root)}"
+    local vdf="$steam_root/config/loginusers.vdf"
+    local authorized_id
+    authorized_id="$(get_authorized_steamid "$GATEKEEPER_CONFIG" || true)"
+
+    [ -f "$vdf" ] || return 0
+
+    local active_id=""
+    active_id="$(get_active_steamid "$vdf" || true)"
+    [ -n "$active_id" ] || return 0
+
+    local real_steam
+    real_steam="$(find_real_steam)"
+    local current_mode
+    current_mode="$(get_current_session_mode "$steam_root")"
+
+    if [ -n "$authorized_id" ] && [ "$active_id" != "$authorized_id" ]; then
+        if [ "$current_mode" = "modded" ]; then
+            log_watcher "QUARANTINE TRIGGER: Active user=${active_id} is unauthorized (expected ${authorized_id}) while in modded mode. Enforcing clean mode."
+            manage_stplugin "hide" "$steam_root"
+            restart_steam "clean" "$steam_root" "$real_steam"
+            return 1
+        fi
+        return 0
+    fi
+
+    if [ -n "$authorized_id" ] && [ "$active_id" = "$authorized_id" ]; then
+        if [ "$current_mode" = "clean" ]; then
+            log_watcher "RESTORE TRIGGER: Active user=${active_id} is authorized (${authorized_id}) while in clean mode. Restoring modded mode."
+            manage_stplugin "restore" "$steam_root"
+            restart_steam "modded" "$steam_root" "$real_steam"
+            return 2
+        fi
+        return 0
+    fi
+
+    return 0
+}
+
+run_watcher_daemon() {
+    local steam_root
+    steam_root="$(find_steam_root)"
+    local vdf="$steam_root/config/loginusers.vdf"
+    local interval="${WATCHER_INTERVAL:-2}"
+
+    log_watcher "Watcher daemon started (PID=$$). Monitoring: ${vdf}"
+
+    mkdir -p "$WATCHER_STATE_DIR" 2>/dev/null || true
+    printf '%s' "$$" > "$WATCHER_PIDFILE" 2>/dev/null || true
+    trap 'rm -f "$WATCHER_PIDFILE" 2>/dev/null || true; exit 0' EXIT INT TERM
+
+    local last_mtime=""
+    while true; do
+        if is_steam_running; then
+            local cur_mtime=""
+            if [ -f "$vdf" ]; then
+                cur_mtime="$(stat -c %Y "$vdf" 2>/dev/null || stat -f %m "$vdf" 2>/dev/null || echo 0)"
+            fi
+
+            if [ "$cur_mtime" != "$last_mtime" ]; then
+                last_mtime="$cur_mtime"
+                watch_step "$steam_root" || true
+            fi
+        fi
+
+        if command -v inotifywait >/dev/null 2>&1 && [ -f "$vdf" ]; then
+            inotifywait -q -t "$interval" -e modify,close_write,move "$vdf" >/dev/null 2>&1 || true
+        else
+            sleep "$interval"
+        fi
+    done
+}
+
+ensure_watcher_running() {
+    if [ -f "$WATCHER_PIDFILE" ]; then
+        local pid
+        pid="$(cat "$WATCHER_PIDFILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    mkdir -p "$WATCHER_STATE_DIR" 2>/dev/null || true
+    nohup "$0" --daemon >/dev/null 2>&1 < /dev/null &
+    log_watcher "Spawned background watcher daemon"
+}
+
+main() {
+    local action="${1:---daemon}"
+    case "$action" in
+        --daemon)
+            run_watcher_daemon
+            ;;
+        --step)
+            watch_step
+            ;;
+        --ensure)
+            ensure_watcher_running
+            ;;
+        --trigger-clean)
+            local root
+            root="$(find_steam_root)"
+            manage_stplugin "hide" "$root"
+            restart_steam "clean" "$root" "$(find_real_steam)"
+            ;;
+        --trigger-modded)
+            local root
+            root="$(find_steam_root)"
+            manage_stplugin "restore" "$root"
+            restart_steam "modded" "$root" "$(find_real_steam)"
+            ;;
+        *)
+            echo "Usage: $0 [--daemon|--step|--ensure|--trigger-clean|--trigger-modded]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+if [ "${WATCHER_LIB_ONLY:-0}" = 0 ]; then
+    main "$@"
+fi
+EOF
+}
+
 install_gatekeeper() {
 	local path_dir="$HOME/.local/share/SLSsteam/path"
 	local wrapper="$path_dir/steam"
 	local modded="$path_dir/steam.modded"
+	local watcher="$path_dir/gatekeeper-watcher.sh"
 	local cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/luatools-secure"
 	local cfg_file="$cfg_dir/config.json"
 
@@ -3200,6 +3735,9 @@ install_gatekeeper() {
 
 	gatekeeper_script_content > "$wrapper"
 	chmod 0755 "$wrapper" 2>/dev/null || true
+
+	watcher_script_content > "$watcher"
+	chmod 0755 "$watcher" 2>/dev/null || true
 
 	# Persist security configuration safely
 	local safe_persona safe_account
@@ -3249,26 +3787,50 @@ print_complete() {
 		echo -e "    ${GREEN}•${NC} LuaTools ($(L "plugin" "plugin"))"
 	fi
 	if [ -f "$CR_SO_PATH" ]; then
-		echo -e "    ${GREEN}•${NC} CloudRedirect ($(L "cloud saves" "cloud saves"))"
+		if [ "${CR_FLATPAK_INSTALLED:-0}" = 1 ] || { command -v flatpak >/dev/null 2>&1 && flatpak list 2>/dev/null | grep -q "$CR_FLATPAK_APP_ID"; }; then
+			echo -e "    ${GREEN}•${NC} CloudRedirect ($(L "cloud saves + companion app" "cloud saves + app companheiro" "guardado en la nube + app complementaria"))"
+		else
+			echo -e "    ${GREEN}•${NC} CloudRedirect ($(L "cloud saves hook" "hook de cloud saves" "hook de guardado en la nube"))"
+		fi
 	fi
 	if [ -n "$OPT_AUTHORIZED_STEAMID" ]; then
-		echo -e "    ${GREEN}•${NC} Security Gatekeeper ($(L "Authorized: ${OPT_AUTHORIZED_PERSONA:-User} (${OPT_AUTHORIZED_STEAMID})" "Autorizado: ${OPT_AUTHORIZED_PERSONA:-Usuário} (${OPT_AUTHORIZED_STEAMID})"))"
-		echo -e "      ${DIM}$(L "Clean accounts run 100% official Steam with native Valve Cloud." "Contas limpas rodam a Steam 100% oficial com nuvem nativa da Valve.")${NC}"
+		echo -e "    ${GREEN}•${NC} Security Gatekeeper ($(L "Authorized: ${OPT_AUTHORIZED_PERSONA:-User} (${OPT_AUTHORIZED_STEAMID})" "Autorizado: ${OPT_AUTHORIZED_PERSONA:-Usuário} (${OPT_AUTHORIZED_STEAMID})" "Autorizado: ${OPT_AUTHORIZED_PERSONA:-Usuario} (${OPT_AUTHORIZED_STEAMID})"))"
+		echo -e "      ${DIM}$(L "Clean accounts run 100% official Steam with native Valve Cloud." "Contas limpas rodam a Steam 100% oficial com nuvem nativa da Valve." "Las cuentas limpias ejecutan Steam 100% oficial con Valve Cloud nativo.")${NC}"
 	fi
 	local coverage_policy
 	coverage_policy="$(installed_coverage_policy)"
 	echo -e "  $(L "Launch coverage policy: ${coverage_policy}" \
-	               "Política de cobertura do launcher: ${coverage_policy}")"
+	               "Política de cobertura do launcher: ${coverage_policy}" \
+	               "Política de cobertura del lanzador: ${coverage_policy}")"
 	echo ""
 
-	# Cloud-save guidance: the .so is installed; the user picks a provider and
-	# signs in from Lumen Settings → Cloud Saves (no separate login app).
+	# Cloud-save guidance
 	if [ -f "$CR_SO_PATH" ]; then
-		echo -e "  ${MOON}$(L "Cloud saves:" "Cloud saves:")${NC}"
-		echo -e "    $(L "Open Steam → Lumen Settings → Cloud Saves to pick a provider" \
-		               "Abra a Steam → Configurações do Lumen → Saves na Nuvem para escolher um provedor")"
-		echo -e "    $(L "(Google Drive / OneDrive) and sign in." \
-		               "(Google Drive / OneDrive) e fazer login.")"
+		echo -e "  ${MOON}$(L "Cloud saves (CloudRedirect):" "Cloud saves (CloudRedirect):" "Guardado en la nube (CloudRedirect):")${NC}"
+		if [ "${CR_FLATPAK_INSTALLED:-0}" = 1 ] || { command -v flatpak >/dev/null 2>&1 && flatpak list 2>/dev/null | grep -q "$CR_FLATPAK_APP_ID"; }; then
+			echo -e "    $(L "1. Open CloudRedirect (from Desktop Application Menu or run:" \
+			               "1. Abra o CloudRedirect (pelo Menu de Aplicativos ou execute:" \
+			               "1. Abre CloudRedirect (desde el Menú de Aplicaciones o ejecuta:")"
+			echo -e "         ${DIM}flatpak run org.cloudredirect.CloudRedirect${NC}"
+			echo -e "    $(L "2. Go to 'Cloud Provider' tab, select OneDrive or Google Drive, and sign in." \
+			               "2. Vá na aba 'Cloud Provider', selecione OneDrive ou Google Drive e faça login." \
+			               "2. Ve a la pestaña 'Cloud Provider', selecciona OneDrive o Google Drive e inicia sesión.")"
+		else
+			echo -e "    $(L "CloudRedirect hook is deployed in Steam, but the companion GUI app is not installed." \
+			               "O hook do CloudRedirect está instalado na Steam, mas o app gráfico não foi instalado." \
+			               "El hook de CloudRedirect está activo en Steam, pero la app gráfica complementaria no está instalada.")"
+			echo -e "    $(L "To connect your cloud provider (OneDrive / Google Drive), install the companion app manually:" \
+			               "Para conectar seu provedor de nuvem (OneDrive / Google Drive), instale o app manualmente:" \
+			               "Para vincular tu proveedor de nube (OneDrive / Google Drive), instala la app manualmente:")"
+			echo -e "      ${DIM}flatpak install --user -y flathub org.kde.Platform//6.10${NC}"
+			echo -e "      ${DIM}curl -fL -o /tmp/cloudredirect.flatpak \"https://github.com/Selectively11/CloudRedirect/releases/download/v2.6.5/cloudredirect.flatpak\"${NC}"
+			echo -e "      ${DIM}flatpak install --user -y --bundle /tmp/cloudredirect.flatpak${NC}"
+			echo -e "      ${DIM}flatpak override --user --filesystem=xdg-config/CloudRedirect org.cloudredirect.CloudRedirect${NC}"
+			echo -e "      ${DIM}rm -f /tmp/cloudredirect.flatpak${NC}"
+			echo -e "    $(L "Then launch: flatpak run org.cloudredirect.CloudRedirect" \
+			               "Depois execute: flatpak run org.cloudredirect.CloudRedirect" \
+			               "Luego ejecuta: flatpak run org.cloudredirect.CloudRedirect")"
+		fi
 		echo ""
 	fi
 
@@ -3302,6 +3864,12 @@ $(L "Options" "Opções"):
                   "Instala apenas o slsteam-moon + Lumen (pula o plugin LuaTools).")
   --nolaunch   $(L "Do not auto-start Steam at the end of install." \
                   "Não inicia a Steam automaticamente ao final da instalação.")
+  --cloud-app  $(L "Install the CloudRedirect companion app without prompting." \
+                  "Instala o app companheiro do CloudRedirect sem perguntar." \
+                  "Instala la aplicación complementaria de CloudRedirect sin preguntar.")
+  --no-cloud-app $(L "Skip the CloudRedirect companion app without prompting." \
+                    "Pula o app companheiro do CloudRedirect sem perguntar." \
+                    "Omite la aplicación complementaria de CloudRedirect sin preguntar.")
   --slsteam-channel stable|beta
                $(L "Select the slsteam-moon update channel (default: stable)." \
                   "Seleciona o canal de atualização do slsteam-moon (padrão: stable).")
@@ -3364,6 +3932,8 @@ parse_args() {
 		case "$1" in
 			--noplugin) OPT_NOPLUGIN=1 ;;
 			--nolaunch) OPT_NOLAUNCH=1 ;;
+			--cloud-app)    PREASK_CLOUD_APP="y" ;;
+			--no-cloud-app) PREASK_CLOUD_APP="n" ;;
 			--authorized-steamid)
 				if [ "$#" -lt 2 ]; then
 					OPT_BAD_ARG="$1"

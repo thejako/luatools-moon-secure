@@ -216,13 +216,16 @@ manage_stplugin() {
 # Clean injection variables for unmodded execution
 sanitize_env_for_clean() {
     unset LD_AUDIT
-    # Strip cloud_redirect.so if present in LD_PRELOAD
+    unset LUMEN_BACKEND_DIR
+    unset LUMEN_LUA_DIR
+    pkill -f "$HOME/.local/share/Lumen/lumen" 2>/dev/null || true
+    # Strip cloud_redirect.so and SLSsteam if present in LD_PRELOAD
     if [ -n "${LD_PRELOAD:-}" ]; then
         local new_preload=""
         local IFS=': '
         for item in $LD_PRELOAD; do
             case "$item" in
-                *cloud_redirect.so*) ;;
+                *cloud_redirect.so*|*SLSsteam*|*library-inject*) ;;
                 *) new_preload="${new_preload:+$new_preload:}$item" ;;
             esac
         done
@@ -232,6 +235,24 @@ sanitize_env_for_clean() {
             unset LD_PRELOAD
         fi
     fi
+}
+
+# Launch the session watcher in the background if not already active
+spawn_watcher_if_needed() {
+    local watcher_candidates=(
+        "${GATEKEEPER_WATCHER_BIN:-}"
+        "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/gatekeeper-watcher.sh"
+        "$HOME/.local/share/SLSsteam/path/gatekeeper-watcher.sh"
+    )
+    for w in "${watcher_candidates[@]}"; do
+        if [ -n "$w" ] && [ -x "$w" ]; then
+            "$w" --ensure >/dev/null 2>&1 &
+            return 0
+        elif [ -n "$w" ] && [ -f "$w" ]; then
+            bash "$w" --ensure >/dev/null 2>&1 &
+            return 0
+        fi
+    done
 }
 
 main() {
@@ -249,7 +270,13 @@ main() {
     local real_steam
     real_steam="$(find_real_steam)"
 
+    local wrapper="${GATEKEEPER_WRAPPER_BIN:-$HOME/.local/share/SLSsteam/path/steam}"
+    export STEAMSCRIPT="$wrapper"
+
     log_gatekeeper "INSPECT: root=${steam_root} vdf=${vdf} (exists: $([ -f "$vdf" ] && echo yes || echo no))"
+
+    # Always ensure the real-time session watcher is active
+    spawn_watcher_if_needed
 
     # Determine execution mode:
     # Fail-Secure policy: If no authorized_id is configured, or active_id cannot be verified,
