@@ -126,6 +126,52 @@ get_active_steamid() {
 }
 fi
 
+# Convert 64-bit SteamID to 32-bit AccountID (SteamID3 format)
+# AccountID32 = SteamID64 - 76561197960265728
+steamid64_to_accountid32() {
+    local s64="$1"
+    [ -n "$s64" ] || return 1
+    awk -v id="$s64" 'BEGIN {
+        base = "76561197960265728"
+        if (id ~ /^[0-9]+$/) {
+            printf "%.0f", id - base
+        }
+    }' 2>/dev/null
+}
+
+# Convert 32-bit AccountID back to 64-bit SteamID
+# SteamID64 = AccountID32 + 76561197960265728
+accountid32_to_steamid64() {
+    local acc32="$1"
+    [ -n "$acc32" ] || return 1
+    awk -v id="$acc32" 'BEGIN {
+        base = "76561197960265728"
+        if (id ~ /^[0-9]+$/) {
+            printf "%.0f", id + base
+        }
+    }' 2>/dev/null
+}
+
+# Read currently active AccountID32 from logs/connection_log.txt
+# Steam logs immediately upon logon: RecvMsgClientLogOnResponse() : [U:1:XXXXX] : OK
+get_active_accountid32_from_log() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 1
+    tail -n 60 "$log_file" 2>/dev/null | awk '
+        /RecvMsgClientLogOnResponse\(\)[[:space:]]*:[[:space:]]*\[U:1:[0-9]+\][[:space:]]*:[[:space:]]*OK/ {
+            line = $0
+            sub(/^.*\[U:1:/, "", line)
+            sub(/\].*$/, "", line)
+            match_id = line
+        }
+        END {
+            if (match_id != "") {
+                print match_id
+            }
+        }
+    ' 2>/dev/null | tr -d '\r[:space:]'
+}
+
 if ! declare -f manage_stplugin >/dev/null 2>&1; then
 manage_stplugin() {
     local mode="$1"
@@ -177,6 +223,7 @@ is_steam_running() {
         return $?
     fi
     pgrep -x steam >/dev/null 2>&1 || \
+    pgrep -x steamwebhelper >/dev/null 2>&1 || \
     pgrep -f "/steam.sh" >/dev/null 2>&1 || \
     pgrep -f "ubuntu12_32/steam" >/dev/null 2>&1
 }
@@ -193,7 +240,18 @@ get_current_session_mode() {
     fi
 }
 
-# Graceful or forced restart of Steam
+# Poll until client process is gone. $1 = slices of 100ms.
+await_client_exit() {
+    local slices="$1" i=0
+    while [ "$i" -lt "$slices" ]; do
+        is_steam_running || return 0
+        sleep 0.1
+        i=$(( i + 1 ))
+    done
+    ! is_steam_running
+}
+
+# Graceful or forced fast restart of Steam
 restart_steam() {
     local target_mode="$1" # "clean" or "modded"
     local steam_root="$2"
@@ -212,49 +270,69 @@ restart_steam() {
         return 0
     fi
 
+    # Option 3 Fast Path: SteamOS / Game Mode systemd restart (<1 second)
+    if command -v systemctl >/dev/null 2>&1; then
+        : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+        export XDG_RUNTIME_DIR
+
+        if systemctl --user is-active --quiet steam-launcher.service 2>/dev/null; then
+            log_watcher "Fast Restart: triggering systemctl --user restart steam-launcher.service"
+            setsid nohup systemctl --user restart steam-launcher.service </dev/null >/dev/null 2>&1 &
+            return 0
+        fi
+
+        local gs_unit
+        gs_unit="$(systemctl --user list-units --type=service --state=active --plain --no-legend 'gamescope-session*' 2>/dev/null | awk '{print $1}' | head -n1)"
+        if [ -n "$gs_unit" ]; then
+            log_watcher "Fast Restart: triggering systemctl --user restart ${gs_unit}"
+            setsid nohup systemctl --user restart "$gs_unit" </dev/null >/dev/null 2>&1 &
+            return 0
+        fi
+    fi
+
+    # Option 3 Desktop / Non-systemd Fast Path:
+    # Use 100ms micro-polling instead of 1-second coarse loops
+    if is_steam_running; then
+        if [ -x "$real_steam" ]; then
+            "$real_steam" -shutdown >/dev/null 2>&1 || true
+        elif command -v steam >/dev/null 2>&1; then
+            steam -shutdown >/dev/null 2>&1 || true
+        fi
+
+        # Allow up to 3 seconds (30 slices of 100ms) for clean exit
+        if ! await_client_exit 30; then
+            log_watcher "WARN: Clean exit timeout, escalating to SIGTERM"
+            pkill -TERM -x steam >/dev/null 2>&1 || true
+            pkill -TERM -x steamwebhelper >/dev/null 2>&1 || true
+            if ! await_client_exit 15; then # up to 1.5s
+                log_watcher "WARN: SIGTERM timeout, escalating to SIGKILL"
+                pkill -KILL -x steam >/dev/null 2>&1 || true
+                pkill -KILL -x steamwebhelper >/dev/null 2>&1 || true
+                await_client_exit 10 || true
+            fi
+        fi
+    fi
+
+    # Check if we are in Game Mode without systemctl (rare)
     local in_gamemode=0
     if [ "${XDG_CURRENT_DESKTOP:-}" = "gamescope" ] || [ -n "${STEAMOS_GAMEMODE:-}" ] || pgrep -x gamescope >/dev/null 2>&1; then
         in_gamemode=1
     fi
 
-    # 1. Request graceful shutdown
-    if [ -x "$real_steam" ]; then
-        "$real_steam" -shutdown >/dev/null 2>&1 || true
-    fi
-
-    # Wait up to 6 seconds for Steam to exit cleanly
-    local waited=0
-    while is_steam_running && [ "$waited" -lt 6 ]; do
-        sleep 1
-        waited=$((waited + 1))
-    done
-
-    # 2. Escalate to SIGTERM if still running
-    if is_steam_running; then
-        log_watcher "WARN: Steam did not exit within timeout, sending SIGTERM"
-        pkill -TERM -x steam 2>/dev/null || true
-        sleep 2
-    fi
-
-    # 3. Escalate to SIGKILL if still alive
-    if is_steam_running; then
-        log_watcher "WARN: Steam still running after SIGTERM, sending SIGKILL"
-        pkill -KILL -x steam 2>/dev/null || true
-        sleep 1
-    fi
-
-    # In Game Mode, SteamOS automatically relaunches Steam via PATH
     if [ "$in_gamemode" -eq 1 ]; then
-        log_watcher "Game Mode active: SteamOS session supervisor will relaunch Steam automatically via Gatekeeper"
+        log_watcher "Game Mode active: session supervisor will relaunch Steam automatically via Gatekeeper"
         return 0
     fi
+
+    # Brief settle (100ms) to ensure socket files are cleared
+    sleep 0.1
 
     # In Desktop Mode, launch Steam explicitly through Gatekeeper
     log_watcher "Desktop Mode active: relaunching Steam via ${wrapper}"
     if [ -x "$wrapper" ]; then
-        nohup "$wrapper" >/dev/null 2>&1 < /dev/null &
+        setsid nohup "$wrapper" </dev/null >/dev/null 2>&1 &
     elif [ -x "$real_steam" ]; then
-        nohup "$real_steam" >/dev/null 2>&1 < /dev/null &
+        setsid nohup "$real_steam" </dev/null >/dev/null 2>&1 &
     fi
 }
 
@@ -266,13 +344,34 @@ restart_steam() {
 watch_step() {
     local steam_root="${1:-$(find_steam_root)}"
     local vdf="$steam_root/config/loginusers.vdf"
+    local conn_log="$steam_root/logs/connection_log.txt"
     local authorized_id
     authorized_id="$(get_authorized_steamid "$GATEKEEPER_CONFIG" || true)"
 
-    [ -f "$vdf" ] || return 0
+    [ -n "$authorized_id" ] || return 0
+
+    local authorized_acc32=""
+    authorized_acc32="$(steamid64_to_accountid32 "$authorized_id" || true)"
 
     local active_id=""
-    active_id="$(get_active_steamid "$vdf" || true)"
+    local active_acc32=""
+
+    # Option 2 Instant Detection: check logs/connection_log.txt first
+    if [ -f "$conn_log" ]; then
+        active_acc32="$(get_active_accountid32_from_log "$conn_log" || true)"
+        if [ -n "$active_acc32" ]; then
+            active_id="$(accountid32_to_steamid64 "$active_acc32" || true)"
+        fi
+    fi
+
+    # Fallback to loginusers.vdf if connection log had no log on record
+    if [ -z "$active_id" ] && [ -f "$vdf" ]; then
+        active_id="$(get_active_steamid "$vdf" || true)"
+        if [ -n "$active_id" ]; then
+            active_acc32="$(steamid64_to_accountid32 "$active_id" || true)"
+        fi
+    fi
+
     [ -n "$active_id" ] || return 0
 
     local real_steam
@@ -280,10 +379,18 @@ watch_step() {
     local current_mode
     current_mode="$(get_current_session_mode "$steam_root")"
 
+    # Match check: compare either SteamID64 or AccountID32
+    local is_authorized=0
+    if [ "$active_id" = "$authorized_id" ]; then
+        is_authorized=1
+    elif [ -n "$authorized_acc32" ] && [ -n "$active_acc32" ] && [ "$active_acc32" = "$authorized_acc32" ]; then
+        is_authorized=1
+    fi
+
     # Case A: An unauthorized account is active
-    if [ -n "$authorized_id" ] && [ "$active_id" != "$authorized_id" ]; then
+    if [ "$is_authorized" -eq 0 ]; then
         if [ "$current_mode" = "modded" ]; then
-            log_watcher "QUARANTINE TRIGGER: Active user=${active_id} is unauthorized (expected ${authorized_id}) while in modded mode. Enforcing clean mode."
+            log_watcher "QUARANTINE TRIGGER: Active user=${active_id} ([U:1:${active_acc32:-?}]) is unauthorized (expected ${authorized_id}) while in modded mode. Enforcing clean mode."
             manage_stplugin "hide" "$steam_root"
             restart_steam "clean" "$steam_root" "$real_steam"
             return 1
@@ -292,9 +399,9 @@ watch_step() {
     fi
 
     # Case B: The authorized account is active
-    if [ -n "$authorized_id" ] && [ "$active_id" = "$authorized_id" ]; then
+    if [ "$is_authorized" -eq 1 ]; then
         if [ "$current_mode" = "clean" ]; then
-            log_watcher "RESTORE TRIGGER: Active user=${active_id} is authorized (${authorized_id}) while in clean mode. Restoring modded mode."
+            log_watcher "RESTORE TRIGGER: Active user=${active_id} ([U:1:${active_acc32:-?}]) is authorized (${authorized_id}) while in clean mode. Restoring modded mode."
             manage_stplugin "restore" "$steam_root"
             restart_steam "modded" "$steam_root" "$real_steam"
             return 2
@@ -310,32 +417,44 @@ run_watcher_daemon() {
     local steam_root
     steam_root="$(find_steam_root)"
     local vdf="$steam_root/config/loginusers.vdf"
-    local interval="${WATCHER_INTERVAL:-2}"
+    local conn_log="$steam_root/logs/connection_log.txt"
+    local interval="${WATCHER_INTERVAL:-0.3}"
 
-    log_watcher "Watcher daemon started (PID=$$). Monitoring: ${vdf}"
+    log_watcher "Watcher daemon started (PID=$$). Monitoring: ${vdf} & ${conn_log} (interval=${interval}s)"
 
     # PID file management
     mkdir -p "$WATCHER_STATE_DIR" 2>/dev/null || true
     printf '%s' "$$" > "$WATCHER_PIDFILE" 2>/dev/null || true
     trap 'rm -f "$WATCHER_PIDFILE" 2>/dev/null || true; exit 0' EXIT INT TERM
 
-    local last_mtime=""
+    local last_vdf_mtime=""
+    local last_log_mtime=""
     while true; do
         if is_steam_running; then
-            local cur_mtime=""
+            local cur_vdf_mtime=""
+            local cur_log_mtime=""
             if [ -f "$vdf" ]; then
-                cur_mtime="$(stat -c %Y "$vdf" 2>/dev/null || stat -f %m "$vdf" 2>/dev/null || echo 0)"
+                cur_vdf_mtime="$(stat -c %Y "$vdf" 2>/dev/null || stat -f %m "$vdf" 2>/dev/null || echo 0)"
+            fi
+            if [ -f "$conn_log" ]; then
+                cur_log_mtime="$(stat -c %Y "$conn_log" 2>/dev/null || stat -f %m "$conn_log" 2>/dev/null || echo 0)"
             fi
 
-            if [ "$cur_mtime" != "$last_mtime" ]; then
-                last_mtime="$cur_mtime"
+            if [ "$cur_vdf_mtime" != "$last_vdf_mtime" ] || [ "$cur_log_mtime" != "$last_log_mtime" ]; then
+                last_vdf_mtime="$cur_vdf_mtime"
+                last_log_mtime="$cur_log_mtime"
                 watch_step "$steam_root" || true
             fi
         fi
 
-        # Use inotifywait if available for instantaneous response, otherwise sleep
-        if command -v inotifywait >/dev/null 2>&1 && [ -f "$vdf" ]; then
-            inotifywait -q -t "$interval" -e modify,close_write,move "$vdf" >/dev/null 2>&1 || true
+        # Watch both loginusers.vdf and connection_log.txt with inotifywait if available,
+        # otherwise sleep for sub-second interval (default 0.3s)
+        local watch_targets=()
+        [ -f "$vdf" ] && watch_targets+=("$vdf")
+        [ -f "$conn_log" ] && watch_targets+=("$conn_log")
+
+        if command -v inotifywait >/dev/null 2>&1 && [ "${#watch_targets[@]}" -gt 0 ]; then
+            inotifywait -q -t "$interval" -e modify,close_write,move "${watch_targets[@]}" >/dev/null 2>&1 || true
         else
             sleep "$interval"
         fi

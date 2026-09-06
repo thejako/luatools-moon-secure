@@ -261,6 +261,46 @@ watch_step "$WATCHER_STEAM"
 w_res=$?
 [ "$w_res" -eq 0 ]; check "watcher: already-restored authorized session returns 0 (no-op)" $?
 
+# Subtest 6.5: SteamID64 <-> AccountID32 conversion
+test_acc32="$(steamid64_to_accountid32 "76561198012345678")"
+[ "$test_acc32" = "52079950" ]; check "watcher: steamid64_to_accountid32 accurately computes AccountID32" $?
+
+test_s64="$(accountid32_to_steamid64 "$test_acc32")"
+[ "$test_s64" = "76561198012345678" ]; check "watcher: accountid32_to_steamid64 round-trips correctly" $?
+
+# Subtest 6.6: Parse AccountID from connection_log.txt
+CONN_LOG="$WATCHER_STEAM/logs/connection_log.txt"
+mkdir -p "$WATCHER_STEAM/logs"
+cat > "$CONN_LOG" << 'EOF'
+[2026-09-06 12:00:01] Log-on attempt 1
+[2026-09-06 12:00:02] RecvMsgClientLogOnResponse() : [U:1:52079950] : OK
+[2026-09-06 12:00:03] Session startup complete
+EOF
+parsed_acc32="$(get_active_accountid32_from_log "$CONN_LOG")"
+[ "$parsed_acc32" = "52079950" ]; check "watcher: get_active_accountid32_from_log extracts active SteamID3 AccountID" $?
+
+# Subtest 6.7: Instant quarantine triggered via connection_log.txt before VDF update
+cat >> "$CONN_LOG" << 'EOF'
+[2026-09-06 12:05:10] RecvMsgClientLogOnResponse() : [U:1:99999999] : OK
+EOF
+# Even if VDF still has authorized_id, connection_log has unauthorized account
+cat > "$WATCHER_VDF" << 'EOF'
+"users" {
+	"76561198012345678" {
+		"MostRecent" "1"
+	}
+}
+EOF
+# Ensure stplug-in exists initially (modded mode)
+mkdir -p "$WATCHER_STEAM/config/stplug-in"
+rm -rf "$WATCHER_STEAM/config/stplug-in.modded"
+
+watch_step "$WATCHER_STEAM"
+w_res=$?
+[ "$w_res" -eq 1 ]; check "watcher: detects unauthorized login instantly via connection_log before VDF flush" $?
+[ ! -d "$WATCHER_STEAM/config/stplug-in" ] && [ -d "$WATCHER_STEAM/config/stplug-in.modded" ]
+check "watcher: hides stplug-in when connection_log detects unauthorized session" $?
+
 if [ "$failures" -eq 0 ]; then
     echo
     echo "ALL PASS"
