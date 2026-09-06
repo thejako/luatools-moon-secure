@@ -1,6 +1,16 @@
 # 🌕 luatools-moon-secure
 
-Hardened fork of `luatools-moon` featuring account isolation and an automatic security gatekeeper for SteamOS / Steam Deck.
+Hardened fork of [`luatools-moon`](https://github.com/swwayps/luatools-moon) featuring account isolation and an automatic security gatekeeper for SteamOS / Steam Deck.
+
+## Overview
+
+This project is a security-focused fork of [`luatools-moon`](https://github.com/swwayps/luatools-moon) (the Linux port of `ltsteamplugin` built for [slsteam-moon](https://github.com/swwayps/slsteam-moon)). While upstream provides manifest downloading and native Linux integration, **luatools-moon-secure** adds essential protection layers for multi-account systems:
+
+- 🛡️ **Account Isolation**: Binds the modded stack (SLSsteam, Lumen, LuaTools) exclusively to a designated secondary Steam account.
+- 🚪 **Automatic Security Gatekeeper**: Wraps Steam in both Gaming Mode and Desktop Mode. It checks `loginusers.vdf` on launch:
+  - **Authorized account**: Launches full modded environment with SLSsteam, Lumen, and CloudRedirect.
+  - **Main / unauthorized account**: Launches **100% clean official Steam** — unhooks `LD_AUDIT` (`SLSsteam.so`), unhooks `LD_PRELOAD` (`cloud_redirect.so`), terminates sidecar processes, and hides the `stplug-in` directory so unowned manifest games are never visible to your main account.
+- 👁️ **Session Watcher Daemon**: A lightweight background monitor (`gatekeeper-watcher.sh`) that detects account switching on the fly and immediately enforces clean state if you switch to your main account without restarting Steam.
 
 ## Install
 
@@ -21,21 +31,23 @@ bash install.sh
 > **Requirements:** Linux x86_64 and **native Steam** installed from your package
 > manager. Flatpak and Snap Steam are not supported.
 >
-> **Want Steam theme support?** Use the [`millennium` branch](https://github.com/swwayps/luatools-moon/tree/millennium).
+> **Want Steam theme support?** Use upstream's [`millennium` branch](https://github.com/swwayps/luatools-moon/tree/millennium).
 
 ---
 
-Linux port of the `ltsteamplugin` plugin, built exclusively for the [slsteam-moon](https://github.com/swwayps/slsteam-moon) project. It serves as an integration layer that fetches manifest packs and installs them for slsteam-moon to consume natively on Linux.
-
 ## Credits
 
-Upstream:
+Direct Upstream:
+
+- [swwayps](https://github.com/swwayps/luatools-moon) — creator of `luatools-moon` (the native Linux port of `ltsteamplugin` built for [slsteam-moon](https://github.com/swwayps/slsteam-moon) and [Lumen](https://github.com/swwayps/lumen)), which serves as the direct base for this fork.
+
+Upstream Lineage:
 
 - [piqseu](https://github.com/piqseu/ltsteamplugin) — the `ltsteamplugin`
-  release line this fork tracks. Originally by
-  [madoiscool](https://github.com/madoiscool/ltsteamplugin).
+  release line tracked by `luatools-moon`.
+- [madoiscool](https://github.com/madoiscool/ltsteamplugin) — original creator of `ltsteamplugin`.
 
-Reference material:
+Reference Material & Ecosystem:
 
 - [StarWarsK & geovanygrdt](https://github.com/Star123451/LuaToolsLinux) —
   prior Linux port.
@@ -44,9 +56,14 @@ Reference material:
 - [CloudRedirect](https://github.com/Selectively11/CloudRedirect) by
   Selectively11 — optional cloud saves for unowned games.
 
-## Support
+## Support & Troubleshooting
 
-Open an issue: https://github.com/swwayps/luatools-moon/issues
+- **Issues with this fork, gatekeeper, or installer**: [Open an issue on GitHub](https://github.com/thejako/luatools-moon-secure/issues)
+- **Upstream issues**: If you encounter issues with the base plugin or manifest handling, refer to [swwayps/luatools-moon issues](https://github.com/swwayps/luatools-moon/issues)
+- **Diagnostics**: If you need to generate a privacy-scrubbed diagnostic log bundle when requesting help:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/thejako/luatools-moon-secure/main/diagnose.sh | bash
+  ```
 
 ## Cloud Saves (CloudRedirect)
 
