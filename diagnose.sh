@@ -710,6 +710,8 @@ collect() {
 	done
 	_stage_file "$stage" "slsteam-config.yaml" "$sls_cfg_dir/config.yaml"            "$cap"
 	_stage_file "$stage" "lumen.log"          "$HOME/.lumen.log"                     "$cap"
+	_stage_file "$stage" "gatekeeper.log"     "${XDG_STATE_HOME:-$HOME/.local/state}/slsteam-moon/gatekeeper.log" "$cap"
+	_stage_file "$stage" "gatekeeper-config"  "${XDG_CONFIG_HOME:-$HOME/.config}/luatools-secure/config.json"    "$cap"
 
 	# Steam .desktop launchers — every *steam*.desktop across the standard XDG
 	# app/autostart dirs (shows the LD_AUDIT wrapper Exec line, key for launch

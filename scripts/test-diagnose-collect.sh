@@ -25,6 +25,8 @@ failures=0
 check() { if [ "$2" -eq 0 ]; then printf 'ok:   %s\n' "$1"
 	else printf 'FAIL: %s\n' "$1"; failures=$((failures+1)); fi; }
 
+unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME
+
 FAKE="$(mktemp -d)"
 WORK="$(mktemp -d)"
 TAR="$WORK/bundle.tar.gz"

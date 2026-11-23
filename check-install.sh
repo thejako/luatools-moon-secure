@@ -489,6 +489,34 @@ check_slssteam() {
 		                "config.yaml do SLSsteam ausente em ${sls_cfg}" \
 		                "Falta config.yaml de SLSsteam en ${sls_cfg}")"
 	fi
+
+	local sls_so="$sls_dir/SLSsteam.so"
+	if [ -f "$sls_so" ]; then
+		local so_elf
+		so_elf="$(od -An -tx1 -N5 "$sls_so" 2>/dev/null | tr -d ' \n' || echo "")"
+		if [ "$so_elf" = "7f454c4602" ]; then
+			check_pass "$(L "SLSsteam.so is 64-bit ELF (matches 64-bit Steam client)" \
+			                "SLSsteam.so é ELF 64-bit (compatível com cliente Steam 64-bit)" \
+			                "SLSsteam.so es ELF de 64 bits (compatible con el cliente Steam de 64 bits)")"
+		elif [ "$so_elf" = "7f454c4601" ]; then
+			check_warn "$(L "SLSsteam.so is 32-bit ELF (legacy client only; will not load in 64-bit Steam Beta)" \
+			                "SLSsteam.so é ELF 32-bit (cliente legado apenas; não carregará na Steam Beta 64-bit)" \
+			                "SLSsteam.so es ELF de 32 bits (solo cliente legado; no cargará en Steam Beta 64 bits)")" \
+			           "$(L "Run install.sh to upgrade to slsteam-moon v3.0 (64-bit)." \
+			                "Execute install.sh para atualizar para slsteam-moon v3.0 (64-bit)." \
+			                "Ejecuta install.sh para actualizar a slsteam-moon v3.0 (64 bits).")"
+		fi
+	fi
+
+	local safe_mode="${XDG_STATE_HOME:-$HOME/.local/state}/slsteam-moon/safe_mode"
+	if [ -f "$safe_mode" ]; then
+		check_warn "$(L "SLSsteam recovery safe_mode is active! Steam is forced to launch vanilla." \
+		                "O safe_mode de recuperação do SLSsteam está ativo! A Steam é forçada a rodar vanilla." \
+		                "¡El safe_mode de recuperación de SLSsteam está activo! Steam se ejecutará en modo oficial vanilla.")" \
+		           "$(L "A previous launch failed. Remove ${safe_mode} or re-run install.sh." \
+		                "Uma inicialização anterior falhou. Remova ${safe_mode} ou execute install.sh." \
+		                "Un inicio previo falló. Elimina ${safe_mode} o vuelve a ejecutar install.sh.")"
+	fi
 }
 
 # ============================================================================
@@ -546,6 +574,26 @@ check_lumen_plugin() {
 		           "$(L "If you installed with --noplugin, this is expected." \
 		                "Se instalou com --noplugin, isso é esperado." \
 		                "Si instalaste con --noplugin, esto es esperado.")"
+	fi
+
+	local cef_flag=0
+	for d in "$HOME/.steam/steam" "$HOME/.local/share/Steam" "$HOME/.steam/debian-installation"; do
+		if [ -f "$d/.cef-enable-remote-debugging" ]; then
+			cef_flag=1
+			break
+		fi
+	done
+	if [ "$cef_flag" = 1 ]; then
+		check_pass "$(L "CEF remote debugging flag present" \
+		                "Flag de depuração remota do CEF presente" \
+		                "Flag de depuración remota de CEF presente")"
+	else
+		check_warn "$(L "CEF remote debugging flag (.cef-enable-remote-debugging) missing" \
+		                "Flag de depuração remota (.cef-enable-remote-debugging) ausente" \
+		                "Falta el flag de depuración remota (.cef-enable-remote-debugging)")" \
+		           "$(L "Lumen requires this flag to inject into Steam. The wrapper creates it automatically on launch." \
+		                "O Lumen precisa dessa flag para injetar na Steam. O wrapper a criará automaticamente ao iniciar." \
+		                "Lumen necesita este flag para inyectarse en Steam. El wrapper lo creará automáticamente al arrancar.")"
 	fi
 }
 
