@@ -57,13 +57,21 @@ check "invalid channel value: returns non-zero" "$r"
 parse_args --noplugin; check "--noplugin: returns 0" $?
 [ "$OPT_NOPLUGIN" = 1 ]; check "--noplugin: OPT_NOPLUGIN=1" $?
 
+# --- --check / --no-check ---------------------------------------------------
+parse_args --check; check "--check: returns 0" $?
+[ "$OPT_CHECK" = 1 ]; check "--check: OPT_CHECK=1" $?
+
+parse_args --no-check; check "--no-check: returns 0" $?
+[ "$OPT_CHECK" = 0 ]; check "--no-check: OPT_CHECK=0" $?
+
 # --- --help / -h ------------------------------------------------------------
 parse_args --help; [ "$OPT_HELP" = 1 ]; check "--help: OPT_HELP=1" $?
 parse_args -h;     [ "$OPT_HELP" = 1 ]; check "-h: OPT_HELP=1" $?
 
 # --- state resets between calls ---------------------------------------------
-parse_args --noplugin --slsteam-channel beta --plugin-channel beta --lumen-channel beta; parse_args
+parse_args --noplugin --check --slsteam-channel beta --plugin-channel beta --lumen-channel beta; parse_args
 [ "$OPT_NOPLUGIN" = 0 ]; check "OPT_NOPLUGIN resets to 0 on a fresh parse" $?
+[ "$OPT_CHECK" = "" ];   check "OPT_CHECK resets to empty on a fresh parse" $?
 [ "$OPT_SLS_CHANNEL" = stable ];    check "slsteam channel resets to stable" $?
 [ "$OPT_PLUGIN_CHANNEL" = stable ]; check "plugin channel resets to stable" $?
 [ "$OPT_LUMEN_CHANNEL" = stable ];  check "Lumen channel resets to stable" $?

@@ -35,6 +35,7 @@ OPT_LUMEN_CHANNEL="stable"
 OPT_AUTHORIZED_STEAMID=""
 OPT_AUTHORIZED_PERSONA=""
 OPT_AUTHORIZED_ACCOUNT=""
+OPT_CHECK=""
 
 # ----------------------------------------------------------------------------
 # Repositories / release sources
@@ -4119,6 +4120,18 @@ EOF
 	             "Gatekeeper de seguridad instalado (SteamID autorizado: ${OPT_AUTHORIZED_STEAMID:-ninguno})")"
 }
 
+deploy_check_script() {
+	local path_dir="$HOME/.local/share/SLSsteam/path"
+	local dest="$path_dir/check-install.sh"
+	mkdir -p "$path_dir"
+	if [ -n "${SCRIPT_DIR:-}" ] && [ -f "$SCRIPT_DIR/check-install.sh" ]; then
+		cp -f "$SCRIPT_DIR/check-install.sh" "$dest"
+		chmod 0755 "$dest" 2>/dev/null || true
+	elif command -v curl >/dev/null 2>&1; then
+		curl -fsSL "https://raw.githubusercontent.com/thejako/luatools-moon-secure/main/check-install.sh" -o "$dest" 2>/dev/null && chmod 0755 "$dest" 2>/dev/null || true
+	fi
+}
+
 # ============================================================================
 # Completion notice
 # ============================================================================
@@ -4196,6 +4209,11 @@ print_complete() {
 	echo -e "  $(L "everything. This is normal — just give it a moment." \
 	               "tudo. Isso é normal — é só aguardar um pouco.")"
 	echo ""
+	echo -e "  $(L "You can verify your installation anytime by running:" \
+	               "Você pode verificar a instalação a qualquer momento executando:" \
+	               "Puedes verificar tu instalación en cualquier momento ejecutando:")"
+	echo -e "    ${GREEN}~/.local/share/SLSsteam/path/check-install.sh${NC}"
+	echo ""
 }
 
 # ============================================================================
@@ -4214,6 +4232,12 @@ $(L "Options" "Opções"):
                   "Instala apenas o slsteam-moon + Lumen (pula o plugin LuaTools).")
   --nolaunch   $(L "Do not auto-start Steam at the end of install." \
                   "Não inicia a Steam automaticamente ao final da instalação.")
+  --check      $(L "Run post-install verification check without prompting." \
+                  "Executa a verificação pós-instalação sem perguntar." \
+                  "Ejecuta la comprobación post-instalación sin preguntar.")
+  --no-check   $(L "Skip post-install verification check without prompting." \
+                  "Pula a verificação pós-instalação sem perguntar." \
+                  "Omite la comprobación post-instalación sin preguntar.")
   --keep-millennium $(L "Do not remove millennium's config/data (Old luatools plugin is still removed)." \
                   "Não remover os dados/configurações do Millennium (o plugin luatools antigo ainda será removido)." \
                   "No eliminar la configuración ni datos de Millennium.")
@@ -4267,6 +4291,64 @@ do_autolaunch() {
 	setsid nohup "$wrapper" >/dev/null 2>&1 < /dev/null &
 }
 
+# Optional post-install verification check.
+# Asks user if they want to check their installation (or executes automatically if --check,
+# skips if --no-check). If checks fail, warns and asks before autolaunching.
+run_post_install_check() {
+	local should_run=""
+	if [ "${OPT_CHECK:-}" = "1" ]; then
+		should_run=1
+	elif [ "${OPT_CHECK:-}" = "0" ]; then
+		should_run=0
+	else
+		echo ""
+		local q_en="Would you like to verify that everything is installed correctly?"
+		local q_pt="Deseja verificar se tudo está instalado corretamente?"
+		local q_es="¿Deseas comprobar que todo está bien instalado?"
+
+		if prompt_yes_no "$q_en" "$q_pt" "y" "$q_es"; then
+			should_run=1
+		else
+			should_run=0
+		fi
+	fi
+
+	if [ "$should_run" != "1" ]; then
+		return 0
+	fi
+
+	local check_script=""
+	if [ -n "${SCRIPT_DIR:-}" ] && [ -f "$SCRIPT_DIR/check-install.sh" ]; then
+		check_script="$SCRIPT_DIR/check-install.sh"
+	elif [ -f "$HOME/.local/share/SLSsteam/path/check-install.sh" ]; then
+		check_script="$HOME/.local/share/SLSsteam/path/check-install.sh"
+	fi
+
+	local check_rc=0
+	if [ -n "$check_script" ] && [ -f "$check_script" ]; then
+		bash "$check_script" || check_rc=$?
+	elif command -v curl >/dev/null 2>&1; then
+		bash <(curl -fsSL "https://raw.githubusercontent.com/thejako/luatools-moon-secure/main/check-install.sh") || check_rc=$?
+	else
+		log_warn "$(L "check-install.sh script not found and curl is unavailable." \
+		              "Script check-install.sh não encontrado e curl indisponível." \
+		              "No se encontró el script check-install.sh y curl no está disponible.")"
+		return 0
+	fi
+
+	if [ "$check_rc" -ne 0 ]; then
+		if should_autolaunch; then
+			echo ""
+			local warn_q_en="Verification detected issues. Do you still want to launch Steam? [y/N]"
+			local warn_q_pt="A verificação detectou problemas. Ainda deseja abrir a Steam? [s/N]"
+			local warn_q_es="La comprobación detectó problemas. ¿Deseas iniciar Steam de todos modos? [s/N]"
+			if ! prompt_yes_no "$warn_q_en" "$warn_q_pt" "n" "$warn_q_es"; then
+				OPT_NOLAUNCH=1
+			fi
+		fi
+	fi
+}
+
 # Pure option parser: sets install switches and each component's release
 # channel, records the first invalid argument in OPT_BAD_ARG and returns 1.
 # Resets its output vars each call so it's safe to invoke repeatedly.
@@ -4274,6 +4356,7 @@ parse_args() {
 	OPT_NOPLUGIN=${LUATOOLS_MOON_NOPLUGIN:-0}
 	OPT_NOLAUNCH=${LUATOOLS_MOON_NOLAUNCH:-0}
 	OPT_KEEP_MILLENNIUM=${LUATOOLS_MOON_KEEP_MILLENNIUM:-0}
+	OPT_CHECK=${LUATOOLS_MOON_CHECK:-}
 	OPT_HELP=${LUATOOLS_MOON_HELP:-0}
 	OPT_SLS_CHANNEL="${LUATOOLS_MOON_SLS_CHANNEL:-stable}"
 	OPT_PLUGIN_CHANNEL="${LUATOOLS_MOON_PLUGIN_CHANNEL:-stable}"
@@ -4287,6 +4370,8 @@ parse_args() {
 			--noplugin) OPT_NOPLUGIN=1 ;;
 			--nolaunch) OPT_NOLAUNCH=1 ;;
 			--keep-millennium) OPT_KEEP_MILLENNIUM=1 ;;
+			--check)    OPT_CHECK=1 ;;
+			--no-check) OPT_CHECK=0 ;;
 			--cloud-app)    PREASK_CLOUD_APP="y" ;;
 			--no-cloud-app) PREASK_CLOUD_APP="n" ;;
 			--authorized-steamid)
@@ -4408,8 +4493,12 @@ main() {
 	# run 100% untouched official Steam with native Valve Cloud saves.
 	print_section "$(L "Setting up Security Gatekeeper" "Configurando Gatekeeper de Segurança")"
 	install_gatekeeper
+	deploy_check_script
 
 	print_complete
+
+	# Optional verification check
+	run_post_install_check
 
 	# Open Steam (injected, windowed, detached) so the first post-install launch
 	# is injected and the desktop-coverage re-assert runs. Guarded + opt-out.
