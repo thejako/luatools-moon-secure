@@ -502,7 +502,19 @@ local function default_options(opts)
         local ok = f:write(data); f:close(); return ok and true or false
     end
     opts.exists = opts.exists or function(path) local f = io.open(path, "rb"); if f then f:close(); return true end return false end
-    opts.mkdir = opts.mkdir or function(path) return os.execute('mkdir -p "' .. path .. '"') == 0 end
+    -- lfs, not `mkdir -p "<path>"`: inside double quotes the shell still
+    -- expands $(...) and `...`, and a Steam library directory can legitimately
+    -- contain either (the user names it).
+    opts.mkdir = opts.mkdir or function(path)
+        local ok_lfs, lfs = pcall(require, "lfs")
+        if not ok_lfs then return false end
+        local accum = (path:sub(1, 1) == "/") and "" or "."
+        for seg in path:gmatch("[^/]+") do
+            accum = accum .. "/" .. seg
+            if lfs.attributes(accum, "mode") == nil then lfs.mkdir(accum) end
+        end
+        return lfs.attributes(path, "mode") == "directory"
+    end
     opts.rename = opts.rename or os.rename
     opts.remove = opts.remove or os.remove
     return opts
@@ -510,11 +522,26 @@ end
 
 local JOURNAL_HEADER = "LUATOOLS-PUBLISH-1"
 
+local function sls_config_dir(opts)
+    if opts and type(opts.xdg_config_home) == "string" and opts.xdg_config_home:sub(1, 1) == "/" then
+        return opts.xdg_config_home .. "/SLSsteam"
+    end
+    if opts and opts.home ~= nil then
+        if opts.home == "" then return nil end
+        return opts.home .. "/.config/SLSsteam"
+    end
+    local xdg = os.getenv("XDG_CONFIG_HOME") or ""
+    if xdg:sub(1, 1) == "/" then return xdg .. "/SLSsteam" end
+    local home = os.getenv("HOME") or ""
+    if home == "" then return nil end
+    return home .. "/.config/SLSsteam"
+end
+
 local function journal_path(opts)
     if opts.journal_path then return opts.journal_path end
-    local home = opts.home or os.getenv("HOME") or ""
-    if home == "" then return nil end
-    return home .. "/.config/SLSsteam/.luatools-publish.journal"
+    local cfg_dir = sls_config_dir(opts)
+    if not cfg_dir then return nil end
+    return cfg_dir .. "/.luatools-publish.journal"
 end
 
 local function encode_journal(publications, snapshots, staged)
@@ -895,10 +922,10 @@ local function publish_preview(appid, preview, lua_text, supplied_opts)
     local manifests = preview.manifests or {}
     local preferred = preview.preferred or {}
 
-    local home = opts.home or os.getenv("HOME") or ""
+    local cfg_dir = sls_config_dir(opts)
     local steam_root = opts.steam_root or ""
-    if home == "" or steam_root == "" then return nil, "install paths unavailable" end
-    local store_dir = home .. "/.config/SLSsteam/manifests"
+    if not cfg_dir or steam_root == "" then return nil, "install paths unavailable" end
+    local store_dir = cfg_dir .. "/manifests"
     local target = steam_root .. "/config/stplug-in/" .. tostring(appid) .. ".lua"
     opts.mkdir(store_dir); opts.mkdir(parent_path(target))
 
@@ -912,8 +939,8 @@ local function publish_preview(appid, preview, lua_text, supplied_opts)
     end
     publications[#publications + 1] = { path = target, content = lua_text }
     if opts.sync_pins then
-        local config_path = opts.config_path or (home .. "/.config/SLSsteam/config.yaml")
-        local imports_path = opts.imports_path or (home .. "/.config/SLSsteam/lumen_lua_imports.txt")
+        local config_path = opts.config_path or (cfg_dir .. "/config.yaml")
+        local imports_path = opts.imports_path or (cfg_dir .. "/lumen_lua_imports.txt")
         local config_text, config_error = sync_manifest_pins(
             opts.read_file(config_path), appid, lua_text)
         if not config_text then return nil, config_error end

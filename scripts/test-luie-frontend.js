@@ -1,0 +1,34 @@
+const fs = require("fs");
+const source = fs.readFileSync("plugin/public/luatools.js", "utf8");
+let failures = 0;
+function check(name, condition) {
+  if (condition) console.log("ok   " + name);
+  else { console.log("FAIL " + name); failures++; }
+}
+
+check("L1 source picker renders the Luie login gate in Lumen blue",
+  source.includes("sourceNeedsLogin") && source.includes('lt("Needs login")')
+    && source.includes("#1a9fff"));
+check("L2 managed sources are explicitly identified in settings",
+  source.includes("const isManaged = api.managed === true"));
+check("L3 managed Luie receives the same reorder behavior",
+  source.includes("const canReorder = true")
+    && source.includes("if (canReorder) {")
+    && source.includes("row.addEventListener('dragstart'"));
+check("L4 managed Luie name is not editable",
+  source.includes("if (!isManaged) nameDisplay.onclick"));
+check("L5 managed Luie has no delete control",
+  source.includes("if (!isManaged) row.appendChild(delBtn)"));
+check("L6 Luie retains the same enable toggle as other sources",
+  source.includes('callServerMethod("luatools", "ToggleApi"'));
+check("L7 manual Luie downloads stay behind the managed-source RPC",
+  source.includes('"StartAddViaLuaToolsSource"')
+    && source.includes("source.managed === true"));
+check("L8 connected Luie has no lua.tools badge",
+  !source.includes("<span>lua.tools</span>"));
+// The login gate belongs to the source picker (L1), not the settings list: the
+// Download Sources row already carries the name, toggle and reorder handle.
+check("L9 the Download Sources row carries no login badge",
+  !source.includes("isManaged && api.needsLogin && api.locked"));
+
+process.exitCode = failures ? 1 : 0;

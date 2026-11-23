@@ -23,6 +23,8 @@ ck(){ if [ "$2" = "$3" ]; then echo "ok   - $1"; else echo "FAIL - $1 (want [$2]
 
 # --- is_our_launcher_shim: detection ------------------------------------------
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+SLSM_SYSTEM_BACKUP_ROOT="$TMP/unused-var-lib"
+export SLSM_SYSTEM_BACKUP_ROOT
 SHIM="$TMP/steam"
 {
 	echo '#!/bin/sh'
@@ -554,6 +556,32 @@ ck "flat fallback restores the exact flat owner" "NO-LIB-FLAT-OWNER" \
    "$(sh "$NO_LIB_MIX_OWNER/steam" | head -1)"
 unset SLSM_LAUNCHER_DIRS
 SLSM_KEEP_LAUNCHER_BACKUP=0; SLSM_KEEP_LAUNCHER_TREE=0
+
+# R1-X-17: A shim whose captured original lives in /var/lib/slsteam-moon
+# (with no home system-launcher-backup directory) primes sudo and restores.
+H17="$TMP/h17"; HOME="$H17"; export HOME
+SYS_ONLY_ROOT="$TMP/sys-only-root"
+SYS_ONLY_BIN="$SYS_ONLY_ROOT/usr/bin"
+SYS_ONLY_VAR="$SYS_ONLY_ROOT/var-lib"
+SYS_ONLY_ORIG="$SYS_ONLY_VAR/${SYS_ONLY_BIN#/}/steam.orig"
+mkdir -p "$H17/.local/share/SLSsteam" "$SYS_ONLY_BIN" "$(dirname "$SYS_ONLY_ORIG")"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\n# SLSsteam\nSLSM_ORIG="%s"\nexec /broken/sys-only\n' \
+  "$SYS_ONLY_ORIG" > "$SYS_ONLY_BIN/steam"
+printf '#!/bin/sh\nprintf "SYS-VAR-LIB-ORIG\\n"\n' > "$SYS_ONLY_ORIG"
+chmod 0755 "$SYS_ONLY_BIN/steam" "$SYS_ONLY_ORIG"
+SLSM_LAUNCHER_DIRS=("$SYS_ONLY_BIN")
+SLSM_SYSTEM_BACKUP_ROOT="$SYS_ONLY_VAR"
+SLSM_SYS_APPS="$H17/no-apps"; SLSM_SYS_AUTOSTART="$H17/no-autostart"
+ck "system_restore_pending detects /var/lib backup without home backup dir" "yes" \
+   "$(system_restore_pending && echo yes || echo no)"
+SLSM_SUDO_PRIMED=1; SLSM_SUDO_DENIED=0; SUDO_FAIL=0; export SUDO_FAIL
+OS_RELEASE_FILE=/dev/null
+ck "restore_system_launchers restores from /var/lib without home backup dir" "yes" \
+   "$(restore_system_launchers >/dev/null 2>&1 && echo yes || echo no)"
+ck "restored launcher runs /var/lib original" "SYS-VAR-LIB-ORIG" \
+   "$(sh "$SYS_ONLY_BIN/steam" | head -1)"
+unset SLSM_LAUNCHER_DIRS
+SLSM_SYSTEM_BACKUP_ROOT="$TMP/unused-var-lib"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit "$fail"

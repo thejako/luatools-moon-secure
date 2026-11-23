@@ -5,13 +5,38 @@ local logger = require("plugin_logger")
 local utils = require("plugin_utils")
 local paths = require("paths")
 local cjson = require("json")
-local ryuu_auth = require("ryuu_auth")
+local guard = require("guard")
 
 local fixes = {}
 
-local function shell_quote(value)
-    return "'" .. tostring(value or ""):gsub("'", "'\\''") .. "'"
+-- steam_utils pulls in the millennium shim, which is not available in every
+-- context that loads this module (and not needed unless a fix is applied), so it
+-- is resolved on first use rather than at load time.
+local function default_install_state(appid)
+    return require("steam_utils").get_game_install_state(appid)
 end
+
+-- Every user-controlled value handed to the worker command is single-quoted so a
+-- URL or install path can only ever be data, never shell syntax. guard.shell_quote
+-- is that quoting, shared with the other endpoints instead of re-implemented here.
+local shell_quote = guard.shell_quote
+
+-- Mirrors a fix archive may come from when the FRONTEND supplies the URL. Every
+-- such URL was produced by one of this backend's own RPCs (check_for_fixes ->
+-- files.luatools.work, onlinefix.resolve -> the online-fix mirror), so that set is
+-- closed. Without it the endpoint
+-- accepted any URL and wrote its contents into a directory the caller also chose
+-- — a file write to anywhere the user can write.
+--
+-- One producer is deliberately NOT in this set: lua.tools answers
+-- /api/denuvo/download with a short-lived presigned link on its own storage host,
+-- which cannot be enumerated. That path passes deps.trusted_source instead, and
+-- provenance vouches for it (see validate_apply_target).
+fixes.ALLOWED_FIX_HOSTS = {
+    ["files.luatools.work"] = true,
+    ["index.luatools.work"] = true,
+    ["api.perondepot.xyz"] = true,
+}
 
 function fixes.check_for_fixes(appid)
     if type(appid) == "string" then appid = tonumber(appid) end
@@ -56,29 +81,87 @@ function fixes.check_for_fixes(appid)
     return result
 end
 
-function fixes.apply_game_fix(appid, download_url, install_path, fix_type, game_name)
+-- validate_apply_target(appid, download_url, install_path, deps)
+--   -> url, path   or   nil, error table
+-- Both values arrive from the frontend bridge and neither used to be checked.
+-- The download URL must be an https mirror we published ourselves; the
+-- destination must be exactly the install directory the backend derives for that
+-- AppID from libraryfolders.vdf + appmanifest_<appid>.acf, so the caller cannot
+-- redirect the extraction to an autostart directory, a shell rc file, or the
+-- plugin's own backend/ (which is loaded at the next boot).
+-- validate_apply_target(...) -> url, nil, path   or   nil, error_table
+--
+-- `deps.trusted_source` marks a URL this backend resolved itself through an
+-- authenticated API rather than one the frontend chose. lua.tools answers
+-- /api/denuvo/download with a short-lived PRESIGNED link on its own storage host,
+-- which by design is not a host we can enumerate — so provenance, not a host
+-- allowlist, is what vouches for it. Everything else still applies: https only,
+-- no userinfo, no control characters, and the destination check below.
+function fixes.validate_apply_target(appid, download_url, install_path, deps)
+    deps = deps or {}
+    local url_opts = {}
+    if not deps.trusted_source then
+        url_opts.hosts = fixes.ALLOWED_FIX_HOSTS
+    end
+    local url = guard.https_url(tostring(download_url or ""), url_opts)
+    if not url then
+        return nil, { success = false, errorCode = "invalid_source",
+            error = "This fix download source is not allowed." }
+    end
+    local install_state = deps.install_state or default_install_state
+    local ok_state, state = pcall(install_state, appid)
+    if not ok_state or type(state) ~= "table" or not state.found
+        or type(state.installPath) ~= "string" then
+        return nil, { success = false, errorCode = "not_installed",
+            error = "menu.error.notInstalled" }
+    end
+    if not guard.same_path(install_path, state.installPath) then
+        return nil, { success = false, errorCode = "invalid_destination",
+            error = "The install path does not belong to this game." }
+    end
+    -- The derived path is not trusted blindly either. `installdir` is scraped out
+    -- of appmanifest_<appid>.acf with a pattern that permits "..", which
+    -- normalize_path would happily collapse into a clean path OUTSIDE the library.
+    -- Require it to sit inside a Steam library's steamapps/common, and require the
+    -- directory to exist so a fix is never unpacked into a path we just invented.
+    local contained = deps.library_path
+        or function(path) return require("steam_utils").game_library_path(path) end
+    local ok_contained, canonical = pcall(contained, state.installPath)
+    if not ok_contained or type(canonical) ~= "string" then
+        return nil, { success = false, errorCode = "invalid_destination",
+            error = "The install path is outside the Steam libraries." }
+    end
+    if state.directoryExists == false then
+        return nil, { success = false, errorCode = "not_installed",
+            error = "menu.error.notInstalled" }
+    end
+    return url, nil, canonical
+end
+
+function fixes.apply_game_fix(appid, download_url, install_path, fix_type, game_name, deps)
+    local checked_url, reject, checked_path =
+        fixes.validate_apply_target(appid, download_url, install_path, deps)
+    if not checked_url then
+        logger.warn("LuaTools: refused fix apply for " .. tostring(appid)
+            .. ": " .. tostring(reject and reject.errorCode))
+        return reject
+    end
+    download_url, install_path = checked_url, checked_path
+
     local dest_root = utils.ensure_temp_download_dir()
     local dest_zip = fs.join(dest_root, "fix_" .. tostring(appid) .. ".zip")
     local state_file = fs.join(dest_root, "fix_" .. tostring(appid) .. "_state.json")
+    local backup_root = paths.backend_path(
+        "data/fix_backups/" .. tostring(appid))
+    -- No fix source needs a request credential: the official catalogue hands out
+    -- pre-signed URLs (lua_tools_fixes.resolve_download) and the online-fix
+    -- fallback is a public mirror. The downloader keeps its header-file argument
+    -- so an authenticated source can be wired back in without touching it.
     local header_file = ""
 
-    if tostring(download_url):match("^https://generator%.ryuu%.lol/fixes/") then
-        local auth_header = ryuu_auth.get_header_line()
-        if not auth_header then
-            return {
-                success = false,
-                errorCode = "authentication",
-                error = "Ryuu authentication is required. Add a current session cookie or auth key.",
-            }
-        end
-        header_file = fs.join(dest_root, "fix_" .. tostring(appid) .. "_headers.txt")
-        if m_utils.write_file(header_file, auth_header) == false then
-            return { success = false, error = "Could not prepare Ryuu authentication." }
-        end
-        m_utils.exec("chmod 600 -- " .. shell_quote(header_file))
-    end
-
     logger.log("LuaTools: Applying fix to " .. tostring(install_path))
+    pcall(fs.remove, state_file .. ".stop")
+    pcall(fs.remove, state_file .. ".pid")
     m_utils.write_file(state_file, '{"status": "downloading"}')
 
     local is_windows = m_utils.getenv("OS") == "Windows_NT"
@@ -98,14 +181,66 @@ function fixes.apply_game_fix(appid, download_url, install_path, fix_type, game_
         -- finished after 5 minutes on another). Here only a transfer that is
         -- effectively dead should abort, so the floor is 1 KB/s over 45s.
         local cmd = string.format(
-            "nohup env MAX_TIME=1800 SPEED_LIMIT=1024 SPEED_TIME=45 EXTRACT_NESTED=1 bash %s %s %s %s %s '' %s >> \"${HOME:-/tmp}/.lumen.log\" 2>&1 &",
+            "nohup setsid env MAX_TIME=1800 SPEED_LIMIT=1024 SPEED_TIME=45 EXTRACT_NESTED=1 bash %s %s %s %s %s '' %s %s >> \"${HOME:-/tmp}/.lumen.log\" 2>&1 &",
             shell_quote(sh_path), shell_quote(download_url), shell_quote(dest_zip),
-            shell_quote(install_path), shell_quote(state_file), shell_quote(header_file)
+            shell_quote(install_path), shell_quote(state_file), shell_quote(header_file),
+            shell_quote(backup_root)
         )
         m_utils.exec(cmd)
     end
 
     return { success = true }
+end
+
+function fixes.cancel_game_fix(appid, install_path, transaction, deps)
+    deps = deps or {}
+    appid = tonumber(appid)
+    if not appid or appid <= 0 or appid ~= math.floor(appid) then
+        return { success = false, errorCode = "invalid_appid",
+            error = "Invalid Steam app ID." }
+    end
+    install_path = tostring(install_path or "")
+    if install_path == "" then
+        return { success = false, errorCode = "not_installed",
+            error = "Game is not installed." }
+    end
+    transaction = tostring(transaction or "")
+    if transaction ~= "" and not transaction:match("^txn%.[%w._-]+$") then
+        return { success = false, errorCode = "invalid_transaction",
+            error = "The rollback transaction is invalid." }
+    end
+
+    local dest_root = utils.ensure_temp_download_dir()
+    local state_file = fs.join(dest_root, "fix_" .. tostring(appid) .. "_state.json")
+    local backup_root = deps.backup_root or paths.backend_path(
+        "data/fix_backups/" .. tostring(appid))
+    local script = deps.cancel_script or fs.join(
+        paths.get_plugin_dir(), "backend", "scripts", "cancel_fix.sh")
+    local exec = deps.exec or m_utils.exec
+    local _, ok = exec("bash " .. shell_quote(script) .. " "
+        .. shell_quote(state_file) .. " " .. shell_quote(install_path) .. " "
+        .. shell_quote(backup_root) .. " " .. shell_quote(transaction))
+    if not ok then
+        return { success = false, errorCode = "rollback_failed",
+            error = "The automatic fix could not be rolled back cleanly." }
+    end
+    return { success = true }
+end
+
+function fixes.restore_game_fix(appid, install_path, deps)
+    deps = deps or {}
+    local backup_root = deps.backup_root or paths.backend_path(
+        "data/fix_backups/" .. tostring(appid))
+    local exists = deps.exists or fs.exists
+    if not exists(backup_root) then return true end
+
+    local script = deps.restore_script or fs.join(
+        paths.get_plugin_dir(), "backend", "scripts", "restore_fix.sh")
+    local exec = deps.exec or m_utils.exec
+    local _, ok = exec("bash " .. shell_quote(script) .. " "
+        .. shell_quote(install_path) .. " " .. shell_quote(backup_root))
+    if not ok then return false, "Could not restore the original game files." end
+    return true
 end
 
 function fixes.get_apply_status(appid)
@@ -127,20 +262,32 @@ function fixes.get_apply_status(appid)
                 pcall(fs.remove, state_file)
                 pcall(fs.remove, dest_zip)
                 pcall(fs.remove, header_file)
-            elseif data.status == "failed" then
+            elseif data.status == "failed" or data.status == "cancelled" then
                 pcall(fs.remove, state_file)
+                pcall(fs.remove, dest_zip)
                 pcall(fs.remove, header_file)
-                if data.errorCode == "authentication" then
-                    -- A rejected session is no longer useful. Clear it so the
-                    -- next card click opens the guided authentication modal.
-                    pcall(ryuu_auth.clear)
-                end
             end
             return { success = true, state = data }
         end
     end
 
     return { success = true, state = { status = "downloading" } }
+end
+
+-- Manifest-only official entries still use the same poll/finalize path as an
+-- archive apply. Writing the worker state atomically makes the frontend observe
+-- one terminal extraction event without inventing a second progress protocol.
+function fixes.mark_apply_ready(appid)
+    local dest_root = utils.ensure_temp_download_dir()
+    local state_file = fs.join(dest_root, "fix_" .. tostring(appid) .. "_state.json")
+    local temp_file = state_file .. ".tmp"
+    local ok, wrote = pcall(m_utils.write_file, temp_file,
+        '{"status":"extracted","bytesRead":0,"totalBytes":0}')
+    if not ok or wrote == false or not os.rename(temp_file, state_file) then
+        pcall(os.remove, temp_file)
+        return { success = false, error = "Could not prepare the manifest apply." }
+    end
+    return { success = true }
 end
 
 return fixes

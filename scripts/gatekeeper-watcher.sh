@@ -131,12 +131,11 @@ fi
 steamid64_to_accountid32() {
     local s64="$1"
     [ -n "$s64" ] || return 1
-    awk -v id="$s64" 'BEGIN {
-        base = "76561197960265728"
-        if (id ~ /^[0-9]+$/) {
-            printf "%.0f", id - base
-        }
-    }' 2>/dev/null
+    case "$s64" in
+        *[!0-9]*) return 1 ;;
+        *) ;;
+    esac
+    printf '%s' "$(( s64 - 76561197960265728 ))" 2>/dev/null || return 1
 }
 
 # Convert 32-bit AccountID back to 64-bit SteamID
@@ -144,12 +143,11 @@ steamid64_to_accountid32() {
 accountid32_to_steamid64() {
     local acc32="$1"
     [ -n "$acc32" ] || return 1
-    awk -v id="$acc32" 'BEGIN {
-        base = "76561197960265728"
-        if (id ~ /^[0-9]+$/) {
-            printf "%.0f", id + base
-        }
-    }' 2>/dev/null
+    case "$acc32" in
+        *[!0-9]*) return 1 ;;
+        *) ;;
+    esac
+    printf '%s' "$(( acc32 + 76561197960265728 ))" 2>/dev/null || return 1
 }
 
 # Read currently active AccountID32 from logs/connection_log.txt

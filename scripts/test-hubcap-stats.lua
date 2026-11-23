@@ -4,6 +4,8 @@
 -- 5xx, ...), so the UI can show the real problem instead of always blaming the
 -- key. Run from the repo root AFTER a build: lua5.4 scripts/test-hubcap-stats.lua
 
+package.path = "dist/luatools/backend/?.lua;plugin/backend/?.lua;" .. package.path
+
 -- Programmable HTTP result the stubbed http_client returns.
 local MOCK_RESP, MOCK_ERR = nil, nil
 
@@ -50,11 +52,17 @@ preload("api_manifest", {
 })
 preload("downloads", {})
 preload("fixes", {})
-preload("ryuu_auth", {})
+preload("lua_tools_auth", {})
+preload("lua_tools_fixes", {})
+preload("lua_tools_fix_state", {})
+preload("lua_tools_fix_index", {})
+preload("lua_tools_recommended_add", {})
+preload("lua_tools_auto_fix", { tick = function() return { success = true } end })
 preload("settings.manager", { get_hubcap_api_key = function() return "" end, init_settings = function() end })
 preload("auto_update", {})
 
-local ok_load = pcall(dofile, "dist/luatools/backend/main.lua")
+local ok_load, load_error = pcall(dofile, "dist/luatools/backend/main.lua")
+if not ok_load then io.stderr:write("dist main.lua load failed: " .. tostring(load_error) .. "\n") end
 local fails = 0
 local function check(cond, msg) if cond then print("ok   " .. msg) else print("FAIL " .. msg); fails = fails + 1 end end
 

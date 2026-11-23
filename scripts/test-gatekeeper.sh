@@ -164,6 +164,14 @@ EOF
 chmod +x "$MODDED_WRAPPER_MOCK"
 
 # Case A: Active user matches authorized account -> launches modded wrapper
+VDF="$FAKE_STEAM/config/loginusers.vdf"
+cat > "$VDF" << 'EOF'
+"users" {
+	"76561198012345678" {
+		"MostRecent" "1"
+	}
+}
+EOF
 GATEKEEPER_CONFIG_FILE="$CFG" \
 GATEKEEPER_STEAM_ROOT="$FAKE_STEAM" \
 GATEKEEPER_REAL_STEAM="$REAL_STEAM_MOCK" \
@@ -208,6 +216,9 @@ GATEKEEPER_LIB_ONLY=0 \
 # ----------------------------------------------------------------------------
 # Test 6: Gatekeeper Session Watcher (gatekeeper-watcher.sh)
 # ----------------------------------------------------------------------------
+export GATEKEEPER_CONFIG_FILE="$CFG" # authorized_steamid is 76561198012345678
+export WATCHER_MOCK_STEAM_RUNNING=1
+export WATCHER_SKIP_RESTART_EXEC=1
 WATCHER_SH="$SCRIPT_DIR/gatekeeper-watcher.sh"
 export WATCHER_LIB_ONLY=1
 # shellcheck disable=SC1090
@@ -227,9 +238,6 @@ cat > "$WATCHER_VDF" << 'EOF'
 	}
 }
 EOF
-export GATEKEEPER_CONFIG_FILE="$CFG" # authorized_steamid is 76561198012345678
-export WATCHER_MOCK_STEAM_RUNNING=1
-export WATCHER_SKIP_RESTART_EXEC=1
 
 watch_step "$WATCHER_STEAM"
 w_res=$?

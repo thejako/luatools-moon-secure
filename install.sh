@@ -56,6 +56,9 @@ LUMEN_REPO="swwayps/lumen"
 LUMEN_ASSET="lumen-linux.zip"
 LUMEN_BETA_PATH="dist/lumen-linux.zip"
 LUMEN_DIR="$HOME/.local/share/Lumen"            # binary + lua/ + luatools/
+
+# Stable release fallback. The manifest is small and mutable; every archive URL
+# inside it is pinned to the mirror commit that introduced those exact bytes.
 RELEASE_MIRROR_MANIFEST="https://cdn.jsdelivr.net/gh/swwayps/jsdelivr@main/manifest.json"
 
 # CloudRedirect hook (the patched 32-bit cloud_redirect.so) lives in its own
@@ -63,27 +66,24 @@ RELEASE_MIRROR_MANIFEST="https://cdn.jsdelivr.net/gh/swwayps/jsdelivr@main/manif
 CR_MOON_REPO="swwayps/cloudredirect-moon"
 
 # CloudRedirect (optional) — redirects Steam Cloud for added games to the
-# user's own Google Drive / OneDrive / local folder. We deploy a PATCHED 32-bit
-# hook (cloud_redirect.so) from the cloudredirect-moon repo and load it via the
+# user's own Google Drive / OneDrive / R2 / S3 / local folder. We deploy a
+# patched 32-bit hook plus its CLI from cloudredirect-moon and load the hook via
 # Steam wrapper's LD_PRELOAD. Provider sign-in lives in Lumen Settings → Cloud
 # Saves (the Lumen backend runs the OAuth flow and writes the hook's config
 # directly), so the main line needs no flatpak login app. The flatpak helpers
 # below are retained for the millennium fallback branch only.
 #
-# Why a patched build instead of an upstream release asset: no upstream release
-# ships both fixes we need. 2.0.4 (the `linux` LD_AUDIT tag) attaches reliably
-# but restores saves to a broken "<file>/<sha>" directory layout (games see no
-# save). 2.1.5 (`latest`) restores saves correctly but its LD_PRELOAD init
-# polls steamclient.so for only 10s and then gives up, so on slower-bootstrap
-# distros (Arch/CachyOS) it never attaches. Our branch keeps the 120s wait, the
-# CAS-path healing, and worker-thread crash containment on top of upstream.
-# Built for an old-enough glibc to load in the Steam runtime.
+# The branch follows upstream v2.6.x while retaining the Linux attachment and
+# runtime-safety fixes still needed by this stack. Both artifacts are built for
+# an old-enough glibc to load in the Steam runtime.
 CR_MOON_RAW_BASE="https://raw.githubusercontent.com/${CR_MOON_REPO}/master"
 CR_SO_URL="${CR_MOON_RAW_BASE}/cloud_redirect.so"
+CR_CLI_URL="${CR_MOON_RAW_BASE}/cloud_redirect_cli"
 CR_REPO="Selectively11/CloudRedirect"
 CR_FLATPAK_APP_ID="org.cloudredirect.CloudRedirect"
 CR_DIR="$HOME/.local/share/CloudRedirect"
 CR_SO_PATH="$CR_DIR/cloud_redirect.so"
+CR_CLI_PATH="$CR_DIR/cloud_redirect_cli"
 CR_KDE_RUNTIME="org.kde.Platform//6.10"
 
 # ============================================================================
@@ -207,9 +207,9 @@ prompt_yes_no() {
 # prompting after Steam is gone. Desktop (mutable) installs are unaffected and
 # keep prompting inline. The question strings live here so the pre-ask and the
 # inline sites can't drift apart.
-Q_CLOUD_EN="Do you want Steam Cloud saves to work for your games? This installs CloudRedirect, which syncs your saves to your own cloud (Google Drive / OneDrive). Say no if you don't need cloud saves."
-Q_CLOUD_PT="Você quer que os saves da Steam Cloud funcionem nos seus jogos? Isso instala o CloudRedirect, que sincroniza seus saves na sua própria nuvem (Google Drive / OneDrive). Responda não se você não precisa de cloud saves."
-Q_CLOUD_ES="¿Quieres que los guardados de Steam Cloud funcionen en tus juegos? Esto instala CloudRedirect, que sincroniza tus partidas en tu propia nube (Google Drive / OneDrive). Responde no si no necesitas guardado en la nube."
+Q_CLOUD_EN="Do you want Steam Cloud saves to work for your games? This installs CloudRedirect, which syncs to Google Drive, OneDrive, R2, S3 or a custom folder. Say no if you don't need cloud saves."
+Q_CLOUD_PT="Você quer que os saves da Steam Cloud funcionem nos seus jogos? Isso instala o CloudRedirect, com Google Drive, OneDrive, R2, S3 ou uma pasta personalizada. Responda não se você não precisa de cloud saves."
+Q_CLOUD_ES="¿Quieres que los guardados de Steam Cloud funcionen en tus juegos? Esto instala CloudRedirect, que sincroniza tus partidas en tu propia nube (Google Drive, OneDrive, R2, S3 o carpeta personalizada). Responde no si no necesitas guardado en la nube."
 Q_CLOUD_APP_EN="Do you also want to install the CloudRedirect companion app (Flatpak)? This provides a desktop GUI to sign in to your cloud provider (OneDrive / Google Drive)."
 Q_CLOUD_APP_PT="Você também deseja instalar o app companheiro do CloudRedirect (Flatpak)? Ele fornece uma interface gráfica para fazer login no seu provedor de nuvem (OneDrive / Google Drive)."
 Q_CLOUD_APP_ES="¿Deseas instalar también la aplicación complementaria de CloudRedirect (Flatpak)? Proporciona una interfaz gráfica para iniciar sesión en tu proveedor de nube (OneDrive / Google Drive)."
@@ -1298,8 +1298,8 @@ restore_steam_sh() {
 	# 2) The system-wide bootstrap tarball shipped by the steam package.
 	local sys_boot
 	for sys_boot in \
-		/usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz \
-		/usr/share/steam/bootstraplinux_ubuntu12_32.tar.xz; do
+		/usr/lib/steam/bootstraplinux_*.tar.xz \
+		/usr/share/steam/bootstraplinux_*.tar.xz; do
 		if [ -f "$sys_boot" ] && tar xJf "$sys_boot" -C "$data_dir" steam.sh 2>/dev/null; then
 			chmod +x "$data_dir/steam.sh" 2>/dev/null || true
 			log_success "$(L "Restored steam.sh from the system bootstrap" \
@@ -1520,7 +1520,11 @@ cleanup_previous_install() {
 	# CLOSED — and Lumen attaches via that port. So a pre-existing Millennium
 	# install would BLOCK Lumen. Remove the whole framework here (not just the
 	# old plugin dir handled above) so 8080 is free for Lumen.
-	remove_millennium_framework
+	# Keep it as user's request if arguement --keep-millennium is passed. 
+	if [ "${OPT_KEEP_MILLENNIUM:-0}" != 1 ]; then
+		remove_millennium_framework
+	fi
+	
 
 	log_success "$(L "Previous installation cleaned up" "Instalação anterior limpa")"
 }
@@ -1665,34 +1669,42 @@ release_asset_info() {
 	fi
 }
 
+# Resolve a matching GitHub release asset and its fingerprint in ONE request.
+# This avoids stamping metadata from a replacement upload while downloading the
+# URL of the asset it replaced. Returns 2 only when GitHub could not be read.
 github_release_asset_info() {
 	local repo="$1" glob="$2" mode="${3:-latest}" api meta
-	if [ "$mode" = any ]; then
+	if [ "$mode" = "any" ]; then
 		api="https://api.github.com/repos/${repo}/releases?per_page=50"
 		meta="$(api_get "$api")" || return 2
 		printf '%s' "$meta" | jq -c --arg glob "$glob" '
-			[.[] | select(.draft != true and .prerelease != true) as $r
-			 | $r.assets[]? | select(.name | test($glob))
-			 | {tag:$r.tag_name, asset_at:.created_at, size:.size, id:.id,
-			    name:.name, url:.browser_download_url}][0] // {}'
+			[ .[] | select(.draft != true and .prerelease != true) as $r
+			  | $r.assets[]? | select(.name | test($glob))
+			  | {tag:$r.tag_name, asset_at:.created_at, updated_at:.updated_at,
+			     size:.size, id:.id, name:.name, url:.browser_download_url} ][0] // {}' \
+			2>/dev/null || printf '{}'
 	else
 		api="https://api.github.com/repos/${repo}/releases/latest"
 		meta="$(api_get "$api")" || return 2
 		printf '%s' "$meta" | jq -c --arg glob "$glob" '
-			.tag_name as $tag | [.assets[]? | select(.name | test($glob))
-			 | {tag:$tag, asset_at:.created_at, size:.size, id:.id,
-			    name:.name, url:.browser_download_url}][0] // {}'
+			.tag_name as $tag | [ .assets[]? | select(.name | test($glob))
+			  | {tag:$tag, asset_at:.created_at, updated_at:.updated_at,
+			     size:.size, id:.id, name:.name, url:.browser_download_url} ][0] // {}' \
+			2>/dev/null || printf '{}'
 	fi
 }
 
+# Resolve one component from the jsDelivr mirror. The URL and digest are both
+# constrained so a malformed manifest cannot turn the installer into a generic
+# downloader. Returns 2 when the manifest itself is unavailable.
 mirror_release_asset_info() {
 	local key="$1" meta
 	meta="$(api_get "$RELEASE_MIRROR_MANIFEST")" || return 2
 	printf '%s' "$meta" | jq -c --arg key "$key" '
 		if .schema == 1 then (.components[$key] // {}) else {} end
-		| if ((.url // "") | test("^https://cdn[.]jsdelivr[.]net/gh/swwayps/jsdelivr@[0-9a-f]{40}/releases/" + $key + "/"))
+		| if ((.url // "") | startswith("https://cdn.jsdelivr.net/gh/swwayps/jsdelivr@"))
 		     and ((.sha256 // "") | test("^[0-9a-f]{64}$"))
-		  then . else {} end'
+		  then . else {} end' 2>/dev/null || printf '{}'
 }
 
 # Read a component's Beta package metadata directly from its beta branch. Beta
@@ -1748,24 +1760,25 @@ resolve_component_asset() {
 		mirror_info="$(mirror_release_asset_info "$mirror_key")" || mirror_rc=$?
 	fi
 
-	url="$(printf '%s' "$github_info" | jq -r '.url // empty')"
+	url="$(printf '%s' "$github_info" | jq -r '.url // empty' 2>/dev/null)"
 	if [ -n "$url" ]; then
 		RESOLVED_ASSET_URL="$url"
 		RESOLVED_ASSET_INFO="$(printf '%s' "$github_info" |
-			jq -c 'del(.url) + {channel:"stable", source:"github"}')"
-		RESOLVED_FALLBACK_URL="$(printf '%s' "$mirror_info" | jq -r '.url // empty')"
+			jq -c 'del(.url) + {channel:"stable", source:"github"}' 2>/dev/null)"
+		RESOLVED_FALLBACK_URL="$(printf '%s' "$mirror_info" |
+			jq -r '.url // empty' 2>/dev/null)"
 		if [ -n "$RESOLVED_FALLBACK_URL" ]; then
 			RESOLVED_FALLBACK_INFO="$(printf '%s' "$mirror_info" |
-				jq -c 'del(.url, .sha256_url) + {channel:"stable", source:"jsdelivr"}')"
+				jq -c 'del(.url, .sha256_url) + {channel:"stable", source:"jsdelivr"}' 2>/dev/null)"
 		fi
 		return 0
 	fi
 
-	url="$(printf '%s' "$mirror_info" | jq -r '.url // empty')"
+	url="$(printf '%s' "$mirror_info" | jq -r '.url // empty' 2>/dev/null)"
 	if [ -n "$url" ]; then
 		RESOLVED_ASSET_URL="$url"
 		RESOLVED_ASSET_INFO="$(printf '%s' "$mirror_info" |
-			jq -c 'del(.url, .sha256_url) + {channel:"stable", source:"jsdelivr"}')"
+			jq -c 'del(.url, .sha256_url) + {channel:"stable", source:"jsdelivr"}' 2>/dev/null)"
 		return 0
 	fi
 
@@ -1800,13 +1813,94 @@ write_versions_stamp() {
 # flaky, or temporarily down. Distinct from "asset not found" so the user knows
 # it's a connectivity issue to retry, not a broken install.
 forge_unreachable_msg() {
-	L "Couldn't reach GitHub or its jsDelivr mirror. Check your connection and try again in a few minutes." \
-	  "Não foi possível baixar pelo GitHub nem pela mirror do jsDelivr. Verifique sua conexão e tente novamente."
+	L "Couldn't reach GitHub or its jsDelivr mirror to fetch the download. Check your connection and try again in a few minutes." \
+	  "Não foi possível baixar pelo GitHub nem pela mirror do jsDelivr. Verifique sua conexão e tente de novo em alguns minutos."
+}
+
+# verify_sha256 <file> <expected>
+# `expected` may be a bare digest or a `sha256sum`-style line ("<digest>  name").
+# An empty or malformed expectation is a FAILURE, never "nothing to check": a
+# truncated sidecar must not silently disable verification.
+verify_sha256() {
+	local file="$1" expected="$2" want actual
+	[ -f "$file" ] || return 1
+	want="$(printf '%s' "$expected" | awk '{print $1}' | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+	case "$want" in
+	[0-9a-f]*) ;;
+	*) return 1 ;;
+	esac
+	[ "${#want}" -eq 64 ] || return 1
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	actual="$(sha256sum "$file" 2>/dev/null | awk '{print $1}')"
+	[ -n "$actual" ] && [ "$actual" = "$want" ]
+}
+
+# archive_entries_safe <archive>
+# Reject an archive before extracting it if any entry would write outside the
+# destination or create a link. `unzip -qo` strips a leading "/" with a warning
+# but happily honours "../", and a symlink entry lets whatever runs next escape
+# the destination.
+archive_entries_safe() {
+	local archive="$1"
+	# unzip is a hard prerequisite (detect_missing_tools requires it), so the
+	# listing path below always works. python3 is NOT a declared prerequisite, so
+	# it cannot be the only implementation: returning success when it is absent
+	# would silently delete the guard on exactly the systems that lack it.
+	if command -v unzip >/dev/null 2>&1; then
+		local names
+		names="$(unzip -Z1 "$archive" 2>/dev/null)" || return 1
+		[ -n "$names" ] || return 1
+		# Absolute path, Windows drive letter, or a ".." path component.
+		if printf '%s\n' "$names" |
+			grep -Eq '(^/|^\\|^[A-Za-z]:|(^|[/\\])\.\.([/\\]|$))'; then
+			return 1
+		fi
+		# Symlink entries: mode bits live in the "external file attributes" field,
+		# which unzip -Z prints in its long listing as a leading "l".
+		if unzip -Z "$archive" 2>/dev/null | grep -Eq '^l'; then
+			return 1
+		fi
+		return 0
+	fi
+	command -v python3 >/dev/null 2>&1 || return 1
+	python3 - "$archive" <<'PY'
+import sys, zipfile
+
+S_IFLNK = 0xA000
+try:
+    with zipfile.ZipFile(sys.argv[1], "r") as zf:
+        for info in zf.infolist():
+            name = info.filename
+            if not name:
+                continue
+            if name.startswith("/") or name.startswith("\\"):
+                sys.exit(1)
+            # A Windows-style drive letter is an absolute path too.
+            if len(name) > 1 and name[1] == ":":
+                sys.exit(1)
+            parts = name.replace("\\", "/").split("/")
+            if ".." in parts:
+                sys.exit(1)
+            if "\x00" in name or "\r" in name or "\n" in name:
+                sys.exit(1)
+            if (info.external_attr >> 16) & 0xF000 == S_IFLNK:
+                sys.exit(1)
+except zipfile.BadZipFile:
+    sys.exit(1)
+sys.exit(0)
+PY
 }
 
 # Extract a zip into a destination dir, preferring unzip, falling back to python.
+# Entries are validated first and the destination is left untouched when the
+# archive is rejected.
 extract_zip() {
 	local archive="$1" dest="$2"
+	if ! archive_entries_safe "$archive"; then
+		log_warn "$(L "The downloaded archive contains unsafe entries and was not extracted." \
+		             "O pacote baixado contém entradas inseguras e não foi extraído.")"
+		return 1
+	fi
 	mkdir -p "$dest"
 	if command -v unzip >/dev/null 2>&1; then
 		unzip -qo "$archive" -d "$dest"
@@ -1823,36 +1917,79 @@ PY
 	return 1
 }
 
-verify_sha256() {
-	local file="$1" expected="$2" actual
-	[[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
-	actual="$(sha256sum "$file" | cut -d' ' -f1)" || return 1
-	[ "$actual" = "$expected" ]
-}
-
-download_url() {
-	local url="$1" out="$2"
+# download_and_verify <url> <out> [<label>]
+# Fetch a release asset, then verify it against its `<asset>.sha256` sidecar when
+# the release publishes one. A sidecar that is present but does not match is a
+# hard failure. A sidecar that is absent is reported and the install continues,
+# because releases cut before sidecars existed have none.
+#
+# NOTE: a sidecar served from the same release over the same connection does not
+# defend against a compromised publishing account — it detects corruption and a
+# partial mirror/CDN compromise. Detached signatures with a public key embedded
+# here are the actual fix and need a project signing key.
+download_and_verify() {
+	local url="$1" out="$2" label="${3:-download}" expected="${4:-}" quiet_unsigned="${5:-}"
 	curl --proto '=https' --proto-redir '=https' -fL \
-		--connect-timeout 15 --retry 3 --retry-delay 2 "$url" -o "$out"
+		--connect-timeout 15 --retry 3 --retry-delay 2 "$url" -o "$out" || return 1
+	if [ -n "$expected" ]; then
+		if verify_sha256 "$out" "$expected"; then
+			log_info "$(L "Verified $label" "Verificado: $label")"
+			return 0
+		fi
+		rm -f "$out"
+		log_error "$(L "The downloaded $label does not match the mirror manifest." \
+		                 "O $label baixado não corresponde ao manifesto da mirror.")"
+		return 2
+	fi
+	local sidecar="$out.sha256"
+	if curl --proto '=https' --proto-redir '=https' -fsL \
+		--connect-timeout 10 "$url.sha256" -o "$sidecar" 2>/dev/null; then
+		if verify_sha256 "$out" "$(cat "$sidecar" 2>/dev/null)"; then
+			log_info "$(L "Verified $label" "Verificado: $label")"
+			rm -f "$sidecar"
+			return 0
+		fi
+		rm -f "$sidecar" "$out"
+		# Distinct exit code: the callers turn a non-zero return into "could not
+		# reach GitHub", which would send the user to debug their network after an
+		# integrity failure. 2 means "arrived, did not verify".
+		log_error "$(L "The downloaded $label does not match its published signature." \
+		             "O $label baixado não corresponde à assinatura publicada.")"
+		return 2
+	fi
+	rm -f "$sidecar"
+	# Some artefacts are served as raw repo files that never publish a sidecar
+	# (e.g. CloudRedirect's hook). Callers pass a non-empty 5th argument to keep
+	# that expected, permanent case quiet instead of warning on every run.
+	[ -n "$quiet_unsigned" ] || log_warn "$(L "No published signature for $label; continuing unverified." \
+	             "Sem assinatura publicada para $label; continuando sem verificação.")"
+	return 0
 }
 
+# Download the URL selected by resolve_component_asset. A transport failure may
+# fall back to the already-resolved jsDelivr entry. An integrity failure never
+# does: changing sources must not turn corrupted bytes into a successful install.
 download_resolved_asset() {
-	local out="$1" label="${2:-download}" expected rc=0
+	local out="$1" label="${2:-download}" rc=0 expected=""
 	DOWNLOADED_ASSET_INFO="$RESOLVED_ASSET_INFO"
-	expected="$(printf '%s' "$RESOLVED_ASSET_INFO" | jq -r '.sha256 // empty')"
-	if download_url "$RESOLVED_ASSET_URL" "$out"; then
-		[ -z "$expected" ] || verify_sha256 "$out" "$expected" || return 2
-		return 0
-	fi
-	[ -n "$RESOLVED_FALLBACK_URL" ] || return 1
+	expected="$(printf '%s' "$RESOLVED_ASSET_INFO" | jq -r '.sha256 // empty' 2>/dev/null)"
+	download_and_verify "$RESOLVED_ASSET_URL" "$out" "$label" "$expected" || rc=$?
+	[ "$rc" -eq 0 ] && return 0
+	[ "$rc" -eq 2 ] && return 2
+	[ -n "${RESOLVED_FALLBACK_URL:-}" ] || return "$rc"
+
 	log_warn "$(L "GitHub download failed; trying the jsDelivr mirror." \
 	               "O download pelo GitHub falhou; tentando a mirror do jsDelivr.")"
-	expected="$(printf '%s' "$RESOLVED_FALLBACK_INFO" | jq -r '.sha256 // empty')"
+	rm -f "$out" "$out.sha256"
+	expected="$(printf '%s' "$RESOLVED_FALLBACK_INFO" |
+		jq -r '.sha256 // empty' 2>/dev/null)"
 	[ -n "$expected" ] || return 1
-	download_url "$RESOLVED_FALLBACK_URL" "$out" || rc=$?
-	[ "$rc" -eq 0 ] || return "$rc"
-	verify_sha256 "$out" "$expected" || return 2
-	DOWNLOADED_ASSET_INFO="$RESOLVED_FALLBACK_INFO"
+	rc=0
+	download_and_verify "$RESOLVED_FALLBACK_URL" "$out" "$label" "$expected" || rc=$?
+	if [ "$rc" -eq 0 ]; then
+		DOWNLOADED_ASSET_INFO="$RESOLVED_FALLBACK_INFO"
+	fi
+	return "$rc"
 }
 
 # ============================================================================
@@ -1875,7 +2012,9 @@ install_slsteam_moon() {
 	zip="$tmp/slsteam-moon.zip"
 
 	log_info "$(L "Downloading slsteam-moon" "Baixando slsteam-moon")"
-	download_resolved_asset "$zip" slsteam-moon || fail "$(forge_unreachable_msg)"
+	rc=0
+	download_resolved_asset "$zip" "slsteam-moon" || rc=$?
+	[ "$rc" -eq 0 ] || fail "$(forge_unreachable_msg)"
 	SLS_INFO="$DOWNLOADED_ASSET_INFO"
 
 	log_info "$(L "Extracting" "Extraindo")"
@@ -1926,7 +2065,9 @@ install_lumen() {
 	tmp="$(mktemp -d)"; trap 'rm -rf "${tmp:-}"' RETURN
 	zip="$tmp/$LUMEN_ASSET"
 	log_info "$(L "Downloading Lumen" "Baixando o Lumen")"
-	download_resolved_asset "$zip" Lumen || fail "$(forge_unreachable_msg)"
+	rc=0
+	download_resolved_asset "$zip" "Lumen" || rc=$?
+	[ "$rc" -eq 0 ] || fail "$(forge_unreachable_msg)"
 	LUMEN_INFO="$DOWNLOADED_ASSET_INFO"
 	mkdir -p "$dest"
 	extract_zip "$zip" "$dest" || fail "$(L "Extraction failed" "Falha na extração")"
@@ -2363,6 +2504,37 @@ CR_FLATPAK_INSTALLED=0
 # re-downloading 2 MB. Holds the ETag raw.githubusercontent.com serves for
 # cloud_redirect.so (content-derived, so it changes exactly when the hook does).
 CR_SO_STAMP="$CR_DIR/.cloud_redirect.etag"
+CR_CLI_STAMP="$CR_DIR/.cloud_redirect_cli.etag"
+
+elf_header5() {
+	od -An -tx1 -N5 "$1" 2>/dev/null | tr -d ' \n'
+}
+
+steam_client_is_64bit() {
+	local cand
+	for cand in "$HOME/.steam/steam/steamrt64/steam" \
+	            "$HOME/.local/share/Steam/steamrt64/steam" \
+	            "$HOME/.steam/debian-installation/steamrt64/steam"; do
+		[ -f "$cand" ] || continue
+		[ "$(elf_header5 "$cand")" = "7f454c4602" ] && return 0
+	done
+	return 1
+}
+
+cloudredirect_usable() {
+	[ -f "$CR_SO_PATH" ] || return 1
+	if steam_client_is_64bit && [ "$(elf_header5 "$CR_SO_PATH")" = "7f454c4601" ]; then
+		return 1
+	fi
+	return 0
+}
+
+sls_config_yaml_path() {
+	case "${XDG_CONFIG_HOME:-}" in
+		/*) printf '%s/SLSsteam/config.yaml\n' "$XDG_CONFIG_HOME" ;;
+		*)  printf '%s/.config/SLSsteam/config.yaml\n' "$HOME" ;;
+	esac
+}
 
 # True when the CloudRedirect hook is already deployed on this machine.
 cloudredirect_installed() {
@@ -2372,7 +2544,8 @@ cloudredirect_installed() {
 # ETag of the published hook, or empty when it can't be determined (offline,
 # proxy that strips the header, ...). HEAD only — no payload is transferred.
 cr_published_stamp() {
-	curl -fsSLI "$CR_SO_URL" 2>/dev/null |
+	local url="${1:-$CR_SO_URL}"
+	curl -fsSLI "$url" 2>/dev/null |
 		tr -d '\r' |
 		awk 'tolower($1) == "etag:" { sub(/^[^:]*:[[:space:]]*/, ""); stamp = $0 } END { print stamp }'
 }
@@ -2380,13 +2553,17 @@ cr_published_stamp() {
 # 0 when the deployed hook is known to match the published one. Unknown stays
 # "not current" so the update path runs and settles it by content comparison.
 cr_hook_is_current() {
-	local published stored
+	local published_so stored_so published_cli stored_cli
 	cloudredirect_installed || return 1
+	[ -x "$CR_CLI_PATH" ] || return 1
 	[ -s "$CR_SO_STAMP" ] || return 1
-	published="$(cr_published_stamp)"
-	[ -n "$published" ] || return 1
-	stored="$(cat "$CR_SO_STAMP" 2>/dev/null)"
-	[ "$published" = "$stored" ]
+	[ -s "$CR_CLI_STAMP" ] || return 1
+	published_so="$(cr_published_stamp "$CR_SO_URL")"
+	published_cli="$(cr_published_stamp "$CR_CLI_URL")"
+	[ -n "$published_so" ] && [ -n "$published_cli" ] || return 1
+	stored_so="$(cat "$CR_SO_STAMP" 2>/dev/null)"
+	stored_cli="$(cat "$CR_CLI_STAMP" 2>/dev/null)"
+	[ "$published_so" = "$stored_so" ] && [ "$published_cli" = "$stored_cli" ]
 }
 
 # Patch CURLOPT_FOLLOWLOCATION (0L -> 1L) to fix personal OneDrive 302 redirect chain.
@@ -2444,26 +2621,45 @@ ensure_steam_sdk_symlinks() {
 # into ~/.local/share/CloudRedirect. No-op (beyond the download) when the
 # published hook is byte-identical to the deployed one.
 install_cloudredirect_so() {
-	local tmp so
+	local tmp so cli staged_so staged_cli same_so same_cli
 
 	tmp="$(mktemp -d)"; trap 'rm -rf "${tmp:-}"' RETURN
 	so="$tmp/cloud_redirect.so"
+	cli="$tmp/cloud_redirect_cli"
 
 	log_info "$(L "Downloading cloud_redirect.so" "Baixando cloud_redirect.so")"
-	if ! curl -fL "$CR_SO_URL" -o "$so"; then
+	# The .so is LD_PRELOAD'ed into the Steam process, so it is the highest-value
+	# artefact in the pipeline; it must not be the one download that skips the
+	# protocol pinning and the sidecar check.
+	if ! download_and_verify "$CR_SO_URL" "$so" "CloudRedirect" "" quiet; then
 		log_warn "$(L "Download of cloud_redirect.so failed; skipping cloud saves." \
 		             "Falha ao baixar cloud_redirect.so; pulando cloud saves.")"
 		return 1
 	fi
+	log_info "$(L "Downloading cloud_redirect_cli" "Baixando cloud_redirect_cli")"
+	if ! download_and_verify "$CR_CLI_URL" "$cli" "CloudRedirect CLI" "" quiet; then
+		log_warn "$(L "Download of cloud_redirect_cli failed; skipping cloud saves." \
+		             "Falha ao baixar cloud_redirect_cli; pulando cloud saves.")"
+		return 1
+	fi
 
-	# The Steam client is 32-bit, so the hook must be a 32-bit ELF or it will be
-	# silently ignored by the loader. Verify before deploying. ELF32 magic:
-	# bytes 0-3 = 7f 45 4c 46, byte 4 (EI_CLASS) = 01. Checked via `od`
-	# (coreutils, always present) instead of `file`, which isn't installed by
-	# default on every distro (NixOS notably ships no `file` by default).
-	if [ "$(od -An -tx1 -N5 "$so" 2>/dev/null | tr -d ' \n')" != "7f454c4601" ]; then
-		log_warn "$(L "Downloaded cloud_redirect.so is not 32-bit; skipping cloud saves." \
-		             "cloud_redirect.so baixado não é 32-bit; pulando cloud saves.")"
+	# Match the hook's ELF class to the installed Steam client (7f454c4601 = 32-bit,
+	# 7f454c4602 = 64-bit). Checked via `od` (coreutils) instead of `file`.
+	local want_elf="7f454c4601"
+	steam_client_is_64bit && want_elf="7f454c4602"
+	if [ "$(elf_header5 "$so")" != "$want_elf" ]; then
+		if [ "$want_elf" = "7f454c4602" ]; then
+			log_warn "$(L "CloudRedirect is not yet available for the 64-bit Steam client; skipping cloud saves." \
+			             "CloudRedirect ainda não está disponível para o cliente Steam 64-bit; pulando cloud saves.")"
+		else
+			log_warn "$(L "Downloaded cloud_redirect.so does not match the Steam client architecture; skipping cloud saves." \
+			             "cloud_redirect.so baixado não corresponde à arquitetura da Steam; pulando cloud saves.")"
+		fi
+		return 1
+	fi
+	if [ "$(elf_header5 "$cli")" != "7f454c4601" ] && [ "$(elf_header5 "$cli")" != "7f454c4602" ]; then
+		log_warn "$(L "Downloaded cloud_redirect_cli is not a valid ELF binary; skipping cloud saves." \
+		             "cloud_redirect_cli baixado não é um binário ELF válido; pulando cloud saves.")"
 		return 1
 	fi
 
@@ -2474,7 +2670,10 @@ install_cloudredirect_so() {
 
 	# Nothing changed: leave the deployed file alone and just record the stamp,
 	# so the next run can skip the download entirely.
-	if cmp -s "$so" "$CR_SO_PATH"; then
+	same_so=0; same_cli=0
+	cmp -s "$so" "$CR_SO_PATH" && same_so=1
+	cmp -s "$cli" "$CR_CLI_PATH" && same_cli=1
+	if [ "$same_so" -eq 1 ] && [ "$same_cli" -eq 1 ]; then
 		cr_write_so_stamp
 		log_info "$(L "cloud_redirect.so is already up to date" \
 		             "cloud_redirect.so já está atualizado")"
@@ -2484,35 +2683,44 @@ install_cloudredirect_so() {
 	# Replace by rename so the new hook lands on a fresh inode. Writing over the
 	# existing file in place would corrupt it for any Steam process that still
 	# has it mapped.
-	local staged="$CR_DIR/.cloud_redirect.so.new"
-	if ! cp -f "$so" "$staged" 2>/dev/null; then
+	staged_so="$CR_DIR/.cloud_redirect.so.new"
+	staged_cli="$CR_DIR/.cloud_redirect_cli.new"
+	if ! cp -f "$so" "$staged_so" 2>/dev/null \
+	   || ! cp -f "$cli" "$staged_cli" 2>/dev/null; then
 		log_warn "$(L "Could not stage cloud_redirect.so; skipping cloud saves." \
 		             "Não foi possível preparar o cloud_redirect.so; pulando cloud saves.")"
 		return 1
 	fi
-	chmod 755 "$staged" 2>/dev/null
-	if ! mv -f "$staged" "$CR_SO_PATH" 2>/dev/null; then
-		rm -f "$staged" 2>/dev/null
+	chmod 755 "$staged_so" "$staged_cli" 2>/dev/null
+	if ! mv -f "$staged_so" "$CR_SO_PATH" 2>/dev/null \
+	   || ! mv -f "$staged_cli" "$CR_CLI_PATH" 2>/dev/null; then
+		rm -f "$staged_so" "$staged_cli" 2>/dev/null
 		log_warn "$(L "Could not install cloud_redirect.so; skipping cloud saves." \
 		             "Não foi possível instalar o cloud_redirect.so; pulando cloud saves.")"
 		return 1
 	fi
 
 	cr_write_so_stamp
-	log_success "$(L "cloud_redirect.so installed to $CR_SO_PATH" \
-	             "cloud_redirect.so instalado em $CR_SO_PATH")"
+	log_success "$(L "CloudRedirect hook and CLI installed to $CR_DIR" \
+	             "Hook e CLI do CloudRedirect instalados em $CR_DIR")"
 	return 0
 }
 
 # Persist the published hook's identity next to the deployed .so. Best-effort:
 # a missing stamp only costs a re-download on the next run.
 cr_write_so_stamp() {
-	local published
-	published="$(cr_published_stamp)"
-	if [ -n "$published" ]; then
-		printf '%s\n' "$published" > "$CR_SO_STAMP" 2>/dev/null || true
+	local published_so published_cli
+	published_so="$(cr_published_stamp "$CR_SO_URL")"
+	published_cli="$(cr_published_stamp "$CR_CLI_URL")"
+	if [ -n "$published_so" ]; then
+		printf '%s\n' "$published_so" > "$CR_SO_STAMP" 2>/dev/null || true
 	else
 		rm -f "$CR_SO_STAMP" 2>/dev/null || true
+	fi
+	if [ -n "$published_cli" ]; then
+		printf '%s\n' "$published_cli" > "$CR_CLI_STAMP" 2>/dev/null || true
+	else
+		rm -f "$CR_CLI_STAMP" 2>/dev/null || true
 	fi
 }
 
@@ -2528,7 +2736,7 @@ cr_write_so_stamp() {
 # moon's per-key defaults fill in the rest on load.
 set_disable_cloud() {
 	local want="$1"                                # "yes" or "no"
-	local cfg="$HOME/.config/SLSsteam/config.yaml"
+	local cfg; cfg="$(sls_config_yaml_path)"
 
 	# The config is seeded from slsteam-moon's full template at install time
 	# (seed_slsteam_config); if it somehow isn't there yet, do nothing rather
@@ -2564,7 +2772,7 @@ set_disable_cloud() {
 # every load. Never clobbers an existing config.
 seed_slsteam_config() {
 	local src="$1"
-	local cfg="$HOME/.config/SLSsteam/config.yaml"
+	local cfg; cfg="$(sls_config_yaml_path)"
 
 	[ -f "$cfg" ] && return 0
 	[ -f "$src" ] || return 0
@@ -2580,7 +2788,7 @@ seed_slsteam_config() {
 # LD_PRELOAD cloud_redirect.so. Called on the cloud-save opt-out / hook-missing
 # paths so the config reflects what will actually load.
 sync_cloud_config_with_hook() {
-	if [ -f "$CR_SO_PATH" ]; then
+	if cloudredirect_usable; then
 		set_disable_cloud no
 	else
 		set_disable_cloud yes
@@ -2690,10 +2898,10 @@ install_cloudredirect_flatpak() {
 	tmp="$(mktemp -d)"; trap 'rm -rf "${tmp:-}"' RETURN
 	bundle="$tmp/$(basename "$url")"
 
-	log_info "$(L "Downloading CloudRedirect app" \
-	             "Baixando o app CloudRedirect" \
-	             "Descargando la app CloudRedirect")"
-	if ! curl -fL "$url" -o "$bundle"; then
+	log_info "$(L \"Downloading CloudRedirect app\" \
+	             \"Baixando o app CloudRedirect\" \
+	             \"Descargando la app CloudRedirect\")"
+	if ! download_and_verify "$url" "$bundle" "CloudRedirect app"; then
 		log_warn "$(L "Download of the CloudRedirect app failed; you can install it later." \
 		             "Falha ao baixar o app CloudRedirect; você pode instalá-lo depois." \
 		             "Error al descargar la app CloudRedirect; puedes instalarla más tarde.")"
@@ -3476,12 +3684,11 @@ fi
 steamid64_to_accountid32() {
     local s64="$1"
     [ -n "$s64" ] || return 1
-    awk -v id="$s64" 'BEGIN {
-        base = "76561197960265728"
-        if (id ~ /^[0-9]+$/) {
-            printf "%.0f", id - base
-        }
-    }' 2>/dev/null
+    case "$s64" in
+        *[!0-9]*) return 1 ;;
+        *) ;;
+    esac
+    printf '%s' "$(( s64 - 76561197960265728 ))" 2>/dev/null || return 1
 }
 
 # Convert 32-bit AccountID back to 64-bit SteamID
@@ -3489,12 +3696,11 @@ steamid64_to_accountid32() {
 accountid32_to_steamid64() {
     local acc32="$1"
     [ -n "$acc32" ] || return 1
-    awk -v id="$acc32" 'BEGIN {
-        base = "76561197960265728"
-        if (id ~ /^[0-9]+$/) {
-            printf "%.0f", id + base
-        }
-    }' 2>/dev/null
+    case "$acc32" in
+        *[!0-9]*) return 1 ;;
+        *) ;;
+    esac
+    printf '%s' "$(( acc32 + 76561197960265728 ))" 2>/dev/null || return 1
 }
 
 # Read currently active AccountID32 from logs/connection_log.txt
@@ -3930,7 +4136,7 @@ print_complete() {
 	if [ "$OPT_NOPLUGIN" != 1 ]; then
 		echo -e "    ${GREEN}•${NC} LuaTools ($(L "plugin" "plugin"))"
 	fi
-	if [ -f "$CR_SO_PATH" ]; then
+	if cloudredirect_usable; then
 		if [ "${CR_FLATPAK_INSTALLED:-0}" = 1 ] || { command -v flatpak >/dev/null 2>&1 && flatpak list 2>/dev/null | grep -q "$CR_FLATPAK_APP_ID"; }; then
 			echo -e "    ${GREEN}•${NC} CloudRedirect ($(L "cloud saves + companion app" "cloud saves + app companheiro" "guardado en la nube + app complementaria"))"
 		else
@@ -3949,7 +4155,7 @@ print_complete() {
 	echo ""
 
 	# Cloud-save guidance
-	if [ -f "$CR_SO_PATH" ]; then
+	if cloudredirect_usable; then
 		echo -e "  ${MOON}$(L "Cloud saves (CloudRedirect):" "Cloud saves (CloudRedirect):" "Guardado en la nube (CloudRedirect):")${NC}"
 		if [ "${CR_FLATPAK_INSTALLED:-0}" = 1 ] || { command -v flatpak >/dev/null 2>&1 && flatpak list 2>/dev/null | grep -q "$CR_FLATPAK_APP_ID"; }; then
 			echo -e "    $(L "1. Open CloudRedirect (from Desktop Application Menu or run:" \
@@ -4008,6 +4214,9 @@ $(L "Options" "Opções"):
                   "Instala apenas o slsteam-moon + Lumen (pula o plugin LuaTools).")
   --nolaunch   $(L "Do not auto-start Steam at the end of install." \
                   "Não inicia a Steam automaticamente ao final da instalação.")
+  --keep-millennium $(L "Do not remove millennium's config/data (Old luatools plugin is still removed)." \
+                  "Não remover os dados/configurações do Millennium (o plugin luatools antigo ainda será removido)." \
+                  "No eliminar la configuración ni datos de Millennium.")
   --cloud-app  $(L "Install the CloudRedirect companion app without prompting." \
                   "Instala o app companheiro do CloudRedirect sem perguntar." \
                   "Instala la aplicación complementaria de CloudRedirect sin preguntar.")
@@ -4062,13 +4271,14 @@ do_autolaunch() {
 # channel, records the first invalid argument in OPT_BAD_ARG and returns 1.
 # Resets its output vars each call so it's safe to invoke repeatedly.
 parse_args() {
-	OPT_NOPLUGIN=0
-	OPT_NOLAUNCH=0
-	OPT_HELP=0
+	OPT_NOPLUGIN=${LUATOOLS_MOON_NOPLUGIN:-0}
+	OPT_NOLAUNCH=${LUATOOLS_MOON_NOLAUNCH:-0}
+	OPT_KEEP_MILLENNIUM=${LUATOOLS_MOON_KEEP_MILLENNIUM:-0}
+	OPT_HELP=${LUATOOLS_MOON_HELP:-0}
+	OPT_SLS_CHANNEL="${LUATOOLS_MOON_SLS_CHANNEL:-stable}"
+	OPT_PLUGIN_CHANNEL="${LUATOOLS_MOON_PLUGIN_CHANNEL:-stable}"
+	OPT_LUMEN_CHANNEL="${LUATOOLS_MOON_LUMEN_CHANNEL:-stable}"
 	OPT_BAD_ARG=""
-	OPT_SLS_CHANNEL="stable"
-	OPT_PLUGIN_CHANNEL="stable"
-	OPT_LUMEN_CHANNEL="stable"
 	OPT_AUTHORIZED_STEAMID=""
 	OPT_AUTHORIZED_PERSONA=""
 	OPT_AUTHORIZED_ACCOUNT=""
@@ -4076,6 +4286,7 @@ parse_args() {
 		case "$1" in
 			--noplugin) OPT_NOPLUGIN=1 ;;
 			--nolaunch) OPT_NOLAUNCH=1 ;;
+			--keep-millennium) OPT_KEEP_MILLENNIUM=1 ;;
 			--cloud-app)    PREASK_CLOUD_APP="y" ;;
 			--no-cloud-app) PREASK_CLOUD_APP="n" ;;
 			--authorized-steamid)

@@ -235,7 +235,7 @@ esac
 check "missing curl: does not claim the connection is down" "$r"
 rm -rf "$EMPTYBIN"
 
-# A GitHub outage is not "no internet" while the release mirror is reachable.
+# A GitHub outage is not "no internet" when the release mirror is reachable.
 PROBEBIN="$TESTDIR/probebin"; mkdir -p "$PROBEBIN"
 printf '%s\n' \
 	'#!/bin/sh' \
@@ -247,6 +247,11 @@ printf '%s\n' \
 chmod +x "$PROBEBIN/curl"
 internet_out="$(PATH="$PROBEBIN:$PATH" check_internet 2>&1)"; internet_rc=$?
 [ "$internet_rc" -eq 0 ]; check "GitHub outage: reachable jsDelivr passes connectivity preflight" $?
+case "$internet_out" in
+	*"Internet reachable"*|*"Internet acessível"*) r=0 ;;
+	*) r=1 ;;
+esac
+check "GitHub outage: connectivity success is reported" "$r"
 
 # nixos_pkg_for: nixpkgs attribute names (only "tar" differs -> gnutar).
 [ "$(nixos_pkg_for tar)" = "gnutar" ]; check "nixos_pkg_for: tar -> gnutar" $?

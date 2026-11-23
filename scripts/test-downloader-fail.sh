@@ -26,9 +26,15 @@ TMP="$(mktemp -d)"
 SERVER_PID=""
 cleanup() {
   [ -z "$SERVER_PID" ] || kill "$SERVER_PID" 2>/dev/null || true
+  stop_static_server 2>/dev/null || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
+# file:// is no longer a usable source (the worker refuses it), so the local
+# fixtures are served over loopback http and the worker is told plaintext is
+# expected via ALLOW_HTTP=1.
+. "$REPO/scripts/testlib-httpd.sh"
+start_static_server "$TMP" || { echo "SKIP: no python3 http server"; exit 0; }
 
 err_of() { # read the "error" field from a state json
   sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1"
@@ -44,7 +50,7 @@ error_code_of() {
 # T1: curl failure (source unreachable) -> friendly error + a slog line.
 # ---------------------------------------------------------------------------
 S1="$TMP/t1state.json"
-OUT1="$(MAX_TIME=0 bash "$DL" "file://$TMP/does_not_exist.zip" \
+OUT1="$(MAX_TIME=0 ALLOW_HTTP=1 bash "$DL" "$HTTPD_URL/does_not_exist.zip" \
         "$TMP/t1dl.zip" "$TMP/t1x" "$S1" 2>&1)"
 check "T1 status failed"        "[ \"\$(status_of '$S1')\" = failed ]"
 check "T1 not raw 'curl failed'" "[ \"\$(err_of '$S1')\" != 'curl failed' ]"
@@ -57,7 +63,7 @@ check "T1 emits a downloader slog line" "printf '%s' \"\$OUT1\" | grep -q 'downl
 # ---------------------------------------------------------------------------
 printf 'this is not a zip' > "$TMP/notzip.bin"
 S2="$TMP/t2state.json"
-OUT2="$(MAX_TIME=0 bash "$DL" "file://$TMP/notzip.bin" \
+OUT2="$(MAX_TIME=0 ALLOW_HTTP=1 bash "$DL" "$HTTPD_URL/notzip.bin" \
         "$TMP/t2dl.zip" "$TMP/t2x" "$S2" 2>&1)"
 check "T2 status failed"          "[ \"\$(status_of '$S2')\" = failed ]"
 check "T2 not raw 'extract failed'" "[ \"\$(err_of '$S2')\" != 'extract failed' ]"
@@ -70,15 +76,16 @@ SRC="$TMP/t3src"; mkdir -p "$SRC"; printf 'hello' > "$SRC/1234567.lua"
 ( cd "$SRC" && zip -q -r "$TMP/t3.zip" . ) 2>/dev/null || {
   echo "SKIP: no zip to build fixture"; [ "$fails" -eq 0 ] && exit 0 || exit 1; }
 S3="$TMP/t3state.json"
-OUT3="$(MAX_TIME=0 bash "$DL" "file://$TMP/t3.zip" \
+OUT3="$(MAX_TIME=0 ALLOW_HTTP=1 bash "$DL" "$HTTPD_URL/t3.zip" \
         "$TMP/t3dl.zip" "$TMP/t3x" "$S3" 2>&1)"
 check "T3 status extracted"       "[ \"\$(status_of '$S3')\" = extracted ]"
 check "T3 emits a slog line"      "printf '%s' \"\$OUT3\" | grep -q 'downloader\['"
 
 # ---------------------------------------------------------------------------
-# T4-T6: Ryuu protects fix downloads with a session cookie or X-Auth-Key. An unauthenticated
-# HTTP 401 must be reported as authorization (not as a corrupt archive), and a
-# caller-supplied curl header file must make the same exact worker path succeed.
+# T4-T6: a source may refuse a download with HTTP 401/403. That must be reported
+# as an authorization problem (not as a corrupt archive), and a caller-supplied
+# curl header file must still make the same exact worker path succeed — no
+# shipped source needs one today, but the contract stays wired.
 # ---------------------------------------------------------------------------
 if command -v python3 >/dev/null 2>&1; then
   AUTH_SRC="$TMP/auth-src"; mkdir -p "$AUTH_SRC"; printf 'authenticated' > "$AUTH_SRC/fix.txt"
@@ -132,24 +139,24 @@ PY
   AUTH_URL="http://127.0.0.1:$PORT/fix.zip"
 
   S4="$TMP/t4state.json"
-  OUT4="$(MAX_TIME=0 bash "$DL" "$AUTH_URL" \
+  OUT4="$(MAX_TIME=0 ALLOW_HTTP=1 bash "$DL" "$AUTH_URL" \
           "$TMP/t4dl.zip" "$TMP/t4x" "$S4" 2>&1)"
   check "T4 HTTP 401 status failed" "[ \"\$(status_of '$S4')\" = failed ]"
   check "T4 reports authorization, not corruption" \
-    "err_of '$S4' | grep -qiE 'auth|login|key' && ! err_of '$S4' | grep -qi 'corrupt'"
+    "err_of '$S4' | grep -qiE 'auth|login|sign' && ! err_of '$S4' | grep -qi 'corrupt'"
   check "T4 exposes authentication error code" \
     "[ \"\$(error_code_of '$S4')\" = authentication ]"
 
   printf 'X-Auth-Key: test-secret\n' > "$TMP/t5.headers"
   S5="$TMP/t5state.json"
-  OUT5="$(MAX_TIME=0 bash "$DL" "$AUTH_URL" \
+  OUT5="$(MAX_TIME=0 ALLOW_HTTP=1 bash "$DL" "$AUTH_URL" \
           "$TMP/t5dl.zip" "$TMP/t5x" "$S5" '' "$TMP/t5.headers" 2>&1)"
   check "T5 authenticated status extracted" "[ \"\$(status_of '$S5')\" = extracted ]"
   check "T5 authenticated archive extracted" "[ \"\$(cat '$TMP/t5x/fix.txt')\" = authenticated ]"
 
   printf 'Cookie: session=test-session\n' > "$TMP/t6.headers"
   S6="$TMP/t6state.json"
-  OUT6="$(MAX_TIME=0 bash "$DL" "$AUTH_URL" \
+  OUT6="$(MAX_TIME=0 ALLOW_HTTP=1 bash "$DL" "$AUTH_URL" \
           "$TMP/t6dl.zip" "$TMP/t6x" "$S6" '' "$TMP/t6.headers" 2>&1)"
   check "T6 session-cookie status extracted" "[ \"\$(status_of '$S6')\" = extracted ]"
   check "T6 session-cookie archive extracted" "[ \"\$(cat '$TMP/t6x/fix.txt')\" = authenticated ]"
@@ -161,7 +168,7 @@ fi
 # any connection is attempted (rc=3, "URL using bad/illegal format"). Blaming the
 # network there sends the user chasing a connection problem that does not exist.
 S7="$TMP/t7state.json"
-OUT7="$(MAX_TIME=5 bash "$DL" "https://generator.ryuu.lol/fixes/Gang Beasts.zip" \
+OUT7="$(MAX_TIME=5 bash "$DL" "https://files.example.invalid/fixes/Gang Beasts.zip" \
         "$TMP/t7dl.zip" "$TMP/t7x" "$S7" 2>&1)"
 check "T7 status failed" "[ \"\$(status_of '$S7')\" = failed ]"
 check "T7 blames the address, not the connection" \

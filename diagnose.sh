@@ -314,21 +314,28 @@ _diag_is_wrapper() {
 # fully operational when a `steam`-named alias for the captured original exists.
 # Derived from paths (never by reading a launcher body). Echoes "<alias>\t<status>";
 # status is ready or missing.
-_diag_shim_exec_alias() { # $1 backup-root  $2 launcher-path
-	local backup_root="$1" launcher="$2" alias candidate target
+_diag_shim_exec_alias() { # $1 backup-root  $2 launcher-path  [$3 sys-backup-root]
+	local backup_root="$1" launcher="$2" sys_root="${3:-${DIAG_LAUNCHER_SYSTEM_BACKUP_ROOT:-/var/lib/slsteam-moon/launcher-backup}}"
+	local alias sys_alias candidate target
+	sys_alias="${sys_root%/}/${launcher#/}"
+	sys_alias="${sys_alias%/*}/steam"
 	alias="${backup_root%/}/${launcher#/}"
 	alias="${alias%/*}/steam"
-	for candidate in "$alias" "${backup_root%/}/steam"; do
+	for candidate in "$sys_alias" "$alias" "${backup_root%/}/steam"; do
 		[ -x "$candidate" ] || continue
 		target="$(readlink -f "$candidate" 2>/dev/null || true)"
 		case "$target" in
-			"${backup_root%/}"/*.orig)
+			"${sys_root%/}"/*.orig|"${backup_root%/}"/*.orig)
 				printf '%s\tready' "$candidate"
 				return 0
 				;;
 		esac
 	done
-	printf '%s\tmissing' "$alias"
+	if [ -d "$sys_root" ]; then
+		printf '%s\tmissing' "$sys_alias"
+	else
+		printf '%s\tmissing' "$alias"
+	fi
 }
 
 # Steam's own bootstrap script, the wrapper's last-resort launcher.
@@ -393,13 +400,14 @@ _diag_wrapper_direct_target() { # $1 wrapper-path
 # What the wrapper would exec when the system-launcher SHIM invoked it: the shim
 # exports SLSM_STEAM_BIN pointing at its captured original's `steam`-named alias.
 # Echoes "<path>\t<via>"; via is shim-backup or unavailable.
-_diag_wrapper_shim_target() { # $1 backup-root
-	local backup_root="$1" d c alias status
+_diag_wrapper_shim_target() { # $1 backup-root  [$2 sys-backup-root]
+	local backup_root="$1" sys_root="${2:-${DIAG_LAUNCHER_SYSTEM_BACKUP_ROOT:-/var/lib/slsteam-moon/launcher-backup}}"
+	local d c alias status
 	while IFS= read -r d; do
 		[ -n "$d" ] || continue
 		c="${d%/}/steam"
 		_diag_is_shim "$c" || continue
-		IFS=$'\t' read -r alias status <<<"$(_diag_shim_exec_alias "$backup_root" "$c")"
+		IFS=$'\t' read -r alias status <<<"$(_diag_shim_exec_alias "$backup_root" "$c" "$sys_root")"
 		[ "$status" = ready ] || continue
 		printf '%s\tshim-backup' "$alias"
 		return 0
@@ -412,12 +420,13 @@ _diag_wrapper_shim_target() { # $1 backup-root
 # files cannot enter the diagnostic archive.
 _collect_launch_coverage() {
 	local stage="$1" dest="$stage/launch-coverage.txt" raw
-	local dir launcher status found=0 backup_root backup found_backup=0
+	local dir launcher status found=0 backup_root sys_backup_root backup found_backup=0
 	local exec_alias exec_status
 	local wrapper direct_path direct_via shim_path shim_via
 	raw="$(mktemp "${TMPDIR:-/tmp}/luatools-diag-coverage.XXXXXX" 2>/dev/null || true)"
 	[ -n "$raw" ] || return 0
 	backup_root="${DIAG_LAUNCHER_BACKUP_ROOT:-$HOME/.local/share/SLSsteam/system-launcher-backup}"
+	sys_backup_root="${DIAG_LAUNCHER_SYSTEM_BACKUP_ROOT:-/var/lib/slsteam-moon/launcher-backup}"
 	wrapper="${DIAG_WRAPPER:-$HOME/.local/share/SLSsteam/path/steam}"
 	{
 		printf 'effective policy: %s\n' "$(_diag_effective_policy)"
@@ -436,11 +445,17 @@ _collect_launch_coverage() {
 			# Reported because the alias's absence is invisible otherwise: the
 			# launch then dies before Steam writes any log.
 			IFS=$'\t' read -r exec_alias exec_status \
-				<<<"$(_diag_shim_exec_alias "$backup_root" "$launcher")"
+				<<<"$(_diag_shim_exec_alias "$backup_root" "$launcher" "$sys_backup_root")"
 			printf 'shim exec: %s status=%s\n' "$exec_alias" "$exec_status"
 		done < <(_diag_launcher_dirs)
 		[ "$found" -eq 1 ] || printf 'system launcher: none detected\n'
 
+		if [ -d "$sys_backup_root" ]; then
+			while IFS= read -r -d '' backup; do
+				found_backup=1
+				printf 'backup: mirrored %s\n' "$backup"
+			done < <(find "$sys_backup_root" -type f -name '*.orig' -print0 2>/dev/null | sort -z)
+		fi
 		if [ -d "$backup_root" ]; then
 			while IFS= read -r -d '' backup; do
 				found_backup=1
@@ -574,29 +589,30 @@ _collect_guard_state() { # $1 stage-dir  $2 cap(bytes,0=full)
 # multi-MB console log.
 # ----------------------------------------------------------------------------
 _collect_client_crashes() { # $1 stage-dir  $2 steam-root -> echoes match count
-	local stage="$1" sr="$2" raw f total=0 n
+	local stage="$1" sr="$2" raw filtered f total=0 n
 	[ -n "$sr" ] && [ -d "$sr/logs" ] || { printf 0; return 0; }
 	raw="$(mktemp "${TMPDIR:-/tmp}/luatools-diag-crash.XXXXXX" 2>/dev/null || true)"
 	[ -n "$raw" ] || { printf 0; return 0; }
+	filtered="${raw}.matches"
 
 	for f in "$sr/logs/console-linux.txt" "$sr/logs/console_log.txt" \
 	         "$sr/logs/bootstrap_log.txt"; do
 		[ -f "$f" ] && [ -r "$f" ] || continue
-		n="$(grep -c -F -e '"$STEAMROOT/$STEAMEXEPATH"' -- "$f" 2>/dev/null || true)"
+		grep -F -e '"$STEAMROOT/$STEAMEXEPATH"' -- "$f" 2>/dev/null \
+			| grep -F 'steam.sh' 2>/dev/null > "$filtered" || true
+		n="$(wc -l < "$filtered" 2>/dev/null | tr -d '[:space:]')"
 		case "$n" in ''|*[!0-9]*) n=0 ;; esac
 		[ "$n" -eq 0 ] && continue
 		{
 			printf '===== %s =====\n' "$f"
-			grep -F -e '"$STEAMROOT/$STEAMEXEPATH"' -- "$f" 2>/dev/null \
-				| grep -F 'steam.sh' 2>/dev/null \
-				| tail -n "$DIAG_CRASH_LINES" || true
+			tail -n "$DIAG_CRASH_LINES" "$filtered" 2>/dev/null || true
 			printf '\n'
 		} >> "$raw"
 		total=$(( total + n ))
 	done
 
 	[ -s "$raw" ] && scrub < "$raw" > "$stage/steam-client-crashes.txt"
-	rm -f "$raw"
+	rm -f "$raw" "$filtered"
 	printf '%s' "$total"
 }
 
@@ -683,9 +699,16 @@ collect() {
 		[ "$cap" -gt 0 ] && printf 'note: logs tail-capped to %d bytes to fit the upload limit\n' "$cap"
 	} | scrub > "$stage/summary.txt"
 
-	# Stack logs (complete unless a global cap is in force).
+	# Stack logs (complete unless a global cap is in force), including rotated generations.
+	local sls_cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/SLSsteam"
+	case "${XDG_CONFIG_HOME:-}" in /*) ;; *) sls_cfg_dir="$HOME/.config/SLSsteam" ;; esac
 	_stage_file "$stage" "slsteam.log"        "$HOME/.SLSsteam.log"                  "$cap"
-	_stage_file "$stage" "slsteam-config.yaml" "$HOME/.config/SLSsteam/config.yaml"  "$cap"
+	local rot_gen
+	for rot_gen in 1 2 3; do
+		[ -f "$HOME/.SLSsteam.log.$rot_gen" ] && \
+			_stage_file "$stage" "slsteam.log.$rot_gen" "$HOME/.SLSsteam.log.$rot_gen" "$cap"
+	done
+	_stage_file "$stage" "slsteam-config.yaml" "$sls_cfg_dir/config.yaml"            "$cap"
 	_stage_file "$stage" "lumen.log"          "$HOME/.lumen.log"                     "$cap"
 
 	# Steam .desktop launchers — every *steam*.desktop across the standard XDG

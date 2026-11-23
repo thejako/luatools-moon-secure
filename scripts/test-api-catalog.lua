@@ -1,12 +1,16 @@
 #!/usr/bin/env luajit
 -- Regression test for the split between shipped API defaults and user state.
 
+-- guard.lua is a pure validation module with no side effects, so it is
+-- required for real rather than stubbed.
+package.path = "plugin/backend/?.lua;" .. package.path
 local DEFAULT_PATH = "/plugin/backend/api.defaults.json"
 local LEGACY_PATH = "/plugin/backend/api.json"
 local USER_PATH = "/plugin/backend/data/api.json"
 local remote_manifest
 local write_count = 0
 local hubcap_api_key = "configured"
+local lua_tools_logged_in = false
 
 local function copy(value)
     if type(value) ~= "table" then return value end
@@ -26,6 +30,14 @@ local files = {
                 url = "https://hubcapmanifest.com/api/v1/manifest/<appid>?api_key=<moapikey>",
                 success_code = 200,
                 unavailable_code = 404,
+                enabled = true,
+            },
+            {
+                builtin_id = "luie",
+                name = "Luie",
+                provider = "lua.tools",
+                source_name = "Luie",
+                managed = true,
                 enabled = true,
             },
             {
@@ -49,6 +61,7 @@ local files = {
     -- This is what install.sh migrates from an installation made before the
     -- persistent catalog existed.
     [USER_PATH] = {
+        schema_version = 1,
         api_list = {
             {
                 builtin_id = "morrenus",
@@ -87,6 +100,12 @@ local files = {
                 success_code = 200,
                 unavailable_code = 404,
                 enabled = true,
+            },
+            {
+                name = "Malformed persisted",
+                url = "https://reader@evil.invalid/<appid>",
+                enabled = true,
+                custom = true,
             },
         },
     },
@@ -144,6 +163,11 @@ package.loaded.plugin_utils = {
 package.loaded["settings.manager"] = {
     get_hubcap_api_key = function() return hubcap_api_key end,
 }
+package.loaded.lua_tools_auth = {
+    status = function()
+        return { success = true, configured = lua_tools_logged_in }
+    end,
+}
 
 local api_manifest = dofile("plugin/backend/api_manifest.lua")
 local failures = 0
@@ -163,8 +187,14 @@ local function find_api(list, name)
     end
 end
 
+local function index_of(list, name)
+    for index, api in ipairs(list or {}) do
+        if api.name == name then return index end
+    end
+end
+
 local all = api_manifest.get_all_apis().apis
-check(#all == 5, "live defaults and custom APIs are visible")
+check(#all == 6, "live defaults and custom APIs are visible")
 check(find_api(all, "TwentyTwo Cloud") == nil, "retired TwentyTwo default is removed")
 check(find_api(all, "Sadie (Hubcap)") ~= nil, "legacy Morrenus source adopts the current upstream name")
 check(find_api(all, "Morrenus") == nil, "obsolete source name is not kept as a user-visible rename")
@@ -176,6 +206,16 @@ check(migrated_ryuu and migrated_ryuu.enabled == false, "disabled built-in stays
 check(find_api(all, "API da comunidade") ~= nil, "custom API survives reconciliation")
 check(find_api(all, "Minha SkyAPI") ~= nil,
     "non-default SkyAPI is preserved instead of treated as retired")
+check(find_api(all, "Malformed persisted") == nil,
+    "malformed persisted custom source is excluded during reconciliation")
+local luie = find_api(all, "Luie")
+check(luie and luie.managed == true and luie.needsLogin == true
+    and luie.locked == true and luie.url == "",
+    "Luie is always visible as a managed source without exposing an endpoint")
+check(index_of(all, "Luie") == index_of(all, "Sadie (Hubcap)") + 1,
+    "catalog v1 migration places Luie directly below Sadie")
+check(files[USER_PATH].schema_version == 2,
+    "the one-time Luie ordering migration advances the catalog schema")
 
 local active = api_manifest.load_api_manifest()
 check(find_api(active, "Minha Ryuu") == nil, "disabled API is excluded from downloads")
@@ -204,6 +244,16 @@ check(hubcap_status and hubcap_status.api_key == nil,
     "source status never exposes the configured credential")
 check(keyless_status and keyless_status.needsKey == false and keyless_status.locked == false,
     "sources without credentials retain their normal waiting state")
+local luie_status = find_api(source_status, "Luie")
+check(luie_status and luie_status.needsLogin == true and luie_status.locked == true,
+    "Luie reports Needs login while signed out")
+
+lua_tools_logged_in = true
+source_status = api_manifest.get_api_list().apis
+luie_status = find_api(source_status, "Luie")
+check(luie_status and luie_status.locked == false,
+    "Luie unlocks automatically with the shared lua.tools session")
+lua_tools_logged_in = false
 
 hubcap_api_key = "configured"
 for _, api in ipairs(files[USER_PATH].api_list) do
@@ -230,6 +280,48 @@ api_manifest.add_custom_api({
 })
 all = api_manifest.get_all_apis().apis
 check(find_api(all, "Outra custom") ~= nil, "new custom API is stored in the persistent catalog")
+check(api_manifest.add_custom_api({
+    name = "luie", url = "https://example.invalid/<appid>",
+}).success == false, "custom sources cannot replace the reserved Luie identity")
+check(api_manifest.rename_api("Luie", "Changed").success == false,
+    "managed Luie cannot be renamed")
+check(api_manifest.remove_api("Luie").success == false,
+    "managed Luie cannot be removed")
+
+local reorder_names = {}
+for _, api in ipairs(files[USER_PATH].api_list) do
+    if api.name ~= "Luie" and api.removed ~= true then
+        reorder_names[#reorder_names + 1] = api.name
+    end
+end
+reorder_names[#reorder_names + 1] = "Luie"
+check(api_manifest.set_api_order(reorder_names).success == true,
+    "all sources including managed Luie can be reordered")
+local luie_after_order
+for index, api in ipairs(files[USER_PATH].api_list) do
+    if api.builtin_id == "luie" then luie_after_order = index end
+end
+check(luie_after_order == #files[USER_PATH].api_list,
+    "managed Luie persists at the user-selected position")
+api_manifest.get_all_apis()
+local luie_after_reconcile
+for index, api in ipairs(files[USER_PATH].api_list) do
+    if api.builtin_id == "luie" then luie_after_reconcile = index end
+end
+check(luie_after_reconcile == luie_after_order,
+    "default placement does not override a later user reorder")
+
+local toggled_luie = api_manifest.toggle_api("Luie")
+check(toggled_luie.success and toggled_luie.enabled == false,
+    "managed Luie still allows its enable toggle")
+lua_tools_logged_in = true
+all = api_manifest.get_all_apis().apis
+check(find_api(all, "Luie").enabled == false and find_api(all, "Luie").locked == false,
+    "login unlocks Luie without overriding an explicit disabled preference")
+lua_tools_logged_in = false
+all = api_manifest.get_all_apis().apis
+check(find_api(all, "Luie").enabled == false and find_api(all, "Luie").locked == true,
+    "logout relocks Luie without changing its toggle preference")
 
 api_manifest.remove_api("Sadie (Hubcap)")
 all = api_manifest.get_all_apis().apis
@@ -240,7 +332,7 @@ for _, api in ipairs(files[USER_PATH].api_list) do
 end
 check(hubcap_state and hubcap_state.removed == true, "built-in removal is saved as a tombstone")
 
-files[DEFAULT_PATH].api_list[2].url = "https://new-ryuu.invalid/<appid>"
+files[DEFAULT_PATH].api_list[3].url = "https://new-ryuu.invalid/<appid>"
 all = api_manifest.get_all_apis().apis
 local ryuu = find_api(all, "Minha Ryuu")
 check(ryuu and ryuu.url == "https://new-ryuu.invalid/<appid>", "updated built-in URL comes from shipped defaults")
@@ -250,7 +342,7 @@ remote_manifest = {
     api_list = {
         {
             name = "Ryuu",
-            url = files[DEFAULT_PATH].api_list[2].url,
+            url = files[DEFAULT_PATH].api_list[3].url,
             enabled = true,
         },
         {
@@ -269,6 +361,16 @@ remote_manifest = {
             url = "https://community-feed.invalid/<appid>",
             enabled = true,
         },
+        {
+            name = "Remote without placeholder",
+            url = "https://remote.invalid/all.zip",
+            enabled = true,
+        },
+        {
+            name = "Remote with userinfo",
+            url = "https://remote-reader@evil.invalid/<appid>",
+            enabled = true,
+        },
     },
 }
 local fetched = api_manifest.fetch_free_apis_now()
@@ -277,6 +379,10 @@ check(fetched.success and fetched.count == 3, "fetch reports live built-in and i
 check(find_api(all, "Free remota") ~= nil, "fetch adds a new remote API without replacing custom APIs")
 check(find_api(all, "Feed comunitário") ~= nil,
     "fetch imports an unknown builtin_id as a custom remote API")
+check(find_api(all, "Remote without placeholder") == nil,
+    "fetch rejects a remote source without the appid placeholder")
+check(find_api(all, "Remote with userinfo") == nil,
+    "fetch rejects a remote source with userinfo")
 check(find_api(all, "API da comunidade") ~= nil, "fetch preserves existing custom APIs")
 check(find_api(all, "Minha SkyAPI") ~= nil, "fetch preserves the user's non-default SkyAPI")
 check(find_api(all, "TwentyTwo Cloud") == nil, "fetch cannot reintroduce a retired built-in")

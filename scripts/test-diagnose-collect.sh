@@ -39,6 +39,13 @@ ln -s "$FAKE/.local/share/Steam" "$FAKE/.steam/steam"
 
 printf '[Info] Added 2830030 to AdditionalApps\n[Info] userdata/488150314 cmp1-atl3.steamserver.net\n' \
 	> "$FAKE/.SLSsteam.log"
+printf '[Info] Rotated generation 1 for 2830030\n' \
+	> "$FAKE/.SLSsteam.log.1"
+export DIAG_LAUNCHER_SYSTEM_BACKUP_ROOT="$FAKE/var-lib/slsteam-moon/launcher-backup"
+mkdir -p "$DIAG_LAUNCHER_SYSTEM_BACKUP_ROOT/usr/local/bin"
+printf 'captured root launcher; TOP_SECRET_BACKUP_CANARY\n' \
+	> "$DIAG_LAUNCHER_SYSTEM_BACKUP_ROOT/usr/local/bin/steam.orig"
+chmod 0755 "$DIAG_LAUNCHER_SYSTEM_BACKUP_ROOT/usr/local/bin/steam.orig"
 printf 'PlayNotOwnedGames: 1\nFakeEmail: probe.user@example.com\n' \
 	> "$FAKE/.config/SLSsteam/config.yaml"
 printf '[lumen] connected 76561198448416042 from 203.0.113.99\n' \
@@ -197,7 +204,8 @@ collect "$TAR" 0 2>/dev/null
 tar -tzf "$TAR" >/dev/null 2>&1; check "produces a valid gzip tar" $?
 
 entries="$(tar -tzf "$TAR" 2>/dev/null)"
-echo "$entries" | grep -q 'slsteam\.log'              ; check "contains slsteam.log" $?
+echo "$entries" | grep -q 'slsteam\.log$'             ; check "contains slsteam.log" $?
+echo "$entries" | grep -q 'slsteam\.log\.1$'          ; check "contains rotated slsteam.log.1" $?
 echo "$entries" | grep -q 'slsteam-config\.yaml'      ; check "contains slsteam config" $?
 echo "$entries" | grep -q 'lumen\.log'                ; check "contains lumen.log" $?
 echo "$entries" | grep -q 'steam-logs/content_log\.txt'; check "contains steam content_log" $?
@@ -244,6 +252,7 @@ in_coverage "coverage: vanilla classification" 'status=vanilla'
 in_coverage "coverage: shim exec alias state" 'shim exec: '
 in_coverage "coverage: shim exec alias is ready" 'status=ready'
 in_coverage "coverage: mirrored backup paths" 'backup: mirrored '
+in_coverage "coverage: system-root mirrored backup path" '/home/USER/var-lib/slsteam-moon/launcher-backup/usr/local/bin/steam.orig'
 in_coverage "coverage: legacy backup paths" 'backup: legacy '
 # Which launcher each entry point actually reaches, and whether they disagree.
 # In this fixture the wrapper's direct resolution skips the shim and lands on the
@@ -333,8 +342,9 @@ out_crash() { if grep -qF "$2" <<<"$crash"; then check "$1" 1; else check "$1" 0
 in_crash  "crashes: localized abort line kept" 'Abortado'
 in_crash  "crashes: source file header"        '===== '
 out_crash "crashes: debugger echo excluded"    'STEAM_DEBUGGER'
-grep -q 'client_abnormal_exits: [1-9]' "$EXTRACT/summary.txt" 2>/dev/null
-check "summary counts abnormal client exits" $?
+grep -q '^client_abnormal_exits: 1 (see steam-client-crashes.txt)$' \
+	"$EXTRACT/summary.txt" 2>/dev/null
+check "summary counts only archived abnormal client exits" $?
 # NB: the .dmp minidumps are binary and archived AS-IS by design — they are
 # deliberately excluded from the scrub-leak sweep above (byte-shifting sed
 # edits would corrupt them; see the header note in diagnose.sh).

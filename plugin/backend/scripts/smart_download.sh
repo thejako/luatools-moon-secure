@@ -36,11 +36,12 @@ slog() { printf '%s INFO smart_download[%s pid %s]: %s\n' "$(date -u +%Y-%m-%dT%
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g'; }
 write_state() {
   local status="$1" current="$2" bytes="$3" total="$4" error="${5:-}"
-  local error_code="${6:-}" error_phase="${7:-}" tmp="${STATE_FILE}.tmp.$$"
-  printf '{"status":"%s","currentApi":"%s","bytesRead":%s,"totalBytes":%s,"apiErrors":{},"error":"%s","errorCode":"%s","errorPhase":"%s"}\n' \
-    "$status" "$(json_escape "$current")" "$bytes" "$total" \
+  local error_code="${6:-}" error_phase="${7:-}" error_source="${8:-}"
+  local tmp="${STATE_FILE}.tmp.$$"
+  printf '{"status":"%s","currentApi":"%s","bytesRead":%s,"totalBytes":%s,"progress":%s,"apiErrors":{},"error":"%s","errorCode":"%s","errorPhase":"%s","errorSource":"%s"}\n' \
+    "$status" "$(json_escape "$current")" "$bytes" "$total" "${progress_pct:-0}" \
     "$(json_escape "$error")" "$(json_escape "$error_code")" \
-    "$(json_escape "$error_phase")" > "$tmp"
+    "$(json_escape "$error_phase")" "$(json_escape "$error_source")" > "$tmp"
   mv -f "$tmp" "$STATE_FILE"
 }
 now_ms() { date +%s%3N; }
@@ -54,18 +55,40 @@ rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
 trap 'rm -rf "$WORK" 2>/dev/null; rm -f "$CANDIDATES_FILE" "$COVERAGE_FILE" 2>/dev/null' EXIT
 unset LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT STEAM_RUNTIME_LIBRARY_PATH STEAM_ZENITY
 
-# NUL records: source-index, display-name, URL, accepted HTTP status.
-declare -a C_INDEX C_NAME C_URL C_CODE C_ZIP C_HEAD C_PIPE C_TOTAL_FILE C_TOTAL C_PID C_PARSE_PID C_STATE C_REASON
+# NUL records: source-index, display-name, URL, accepted HTTP status, optional
+# bearer token. The token is copied into a private curl header file, never argv.
+declare -a C_INDEX C_NAME C_URL C_CODE C_ZIP C_HEAD C_PIPE C_TOTAL_FILE C_TOTAL C_PID C_PARSE_PID C_STATE C_REASON C_AUTH_FILE C_PROTO
 n=0
 exec 3< "$CANDIDATES_FILE"
 while IFS= read -r -d '' idx <&3; do
   IFS= read -r -d '' name <&3 || break
   IFS= read -r -d '' url <&3 || break
   IFS= read -r -d '' code <&3 || break
+  IFS= read -r -d '' bearer <&3 || break
   [[ "$idx" =~ ^[0-9]+$ && "$code" =~ ^[0-9]+$ && -n "$url" ]] || continue
+  # Transport policy, decided per candidate from its own URL. curl was called with
+  # no --proto restriction at all, so a candidate could be file:// — reading a
+  # local file into the merge pipeline rather than downloading anything — and an
+  # https candidate could be silently redirected down to http.
+  #
+  # Whether a mirror serves TLS is the operator's choice, so http is accepted; what
+  # is refused is a scheme that is not a download at all, and a downgrade of a
+  # candidate that started out on https.
+  case "$url" in
+    https://*) C_PROTO[n]="=https" ;;
+    http://*) C_PROTO[n]="=http,https" ;;
+    *)
+      slog "dropping candidate $name: unsupported address type"
+      continue ;;
+  esac
   C_INDEX[n]="$idx"; C_NAME[n]="$name"; C_URL[n]="$url"; C_CODE[n]="$code"
   C_ZIP[n]="$WORK/source_${n}.zip"; C_HEAD[n]="$WORK/source_${n}.headers"
   C_PIPE[n]="$WORK/source_${n}.stream"; C_TOTAL_FILE[n]="$WORK/source_${n}.total"
+  C_AUTH_FILE[n]=""
+  if [[ -n "$bearer" ]]; then
+    C_AUTH_FILE[n]="$WORK/source_${n}.auth"
+    printf 'Authorization: Bearer %s\n' "$bearer" > "${C_AUTH_FILE[n]}"
+  fi
   C_TOTAL[n]=""; C_STATE[n]="pending"; C_REASON[n]=""
   n=$((n + 1))
 done
@@ -105,6 +128,50 @@ zip_is_safe_and_usable() {
   [[ "$count" -eq 1 ]]
 }
 
+lua_is_safe_and_usable() {
+  local file="$1" size
+  size="$(stat -c %s "$file" 2>/dev/null)"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 && "$size" -le 16777216 ]] || return 1
+  LC_ALL=C grep -Iq . "$file" || return 1
+  sed 's/--.*$//' "$file" 2>/dev/null | grep -Eq \
+    "^[[:space:]]*addappid[[:space:]]*\\([[:space:]]*${APPID}([[:space:]]*\\)|[[:space:]]*,)"
+}
+
+source_is_safe_and_usable() {
+  zip_is_safe_and_usable "$1" || lua_is_safe_and_usable "$1"
+}
+
+source_limit_reason() {
+  local http="${1:-0}" file="$2" size daily_usage daily_limit
+  # 429 always means request throttling. Do not promote it to a daily limit
+  # even when a provider returns misleading daily-limit prose in the body.
+  [[ "$http" == "429" ]] && { printf 'rate_limited'; return; }
+  size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 && "$size" -le 1048576 ]] || return
+  LC_ALL=C grep -Iq . "$file" 2>/dev/null || return
+  daily_usage="$(grep -Eio '"?daily[_ -]*usage"?[[:space:]]*:[[:space:]]*[0-9]+' "$file" \
+    | grep -Eo '[0-9]+$' | head -n1)"
+  daily_limit="$(grep -Eio '"?daily[_ -]*limit"?[[:space:]]*:[[:space:]]*[0-9]+' "$file" \
+    | grep -Eo '[0-9]+$' | head -n1)"
+  if [[ "$daily_usage" =~ ^[0-9]+$ && "$daily_limit" =~ ^[0-9]+$ \
+      && "$daily_limit" -gt 0 && "$daily_usage" -ge "$daily_limit" ]]; then
+    printf 'daily_limit'; return
+  fi
+  if grep -Eiq 'daily([ _-]+download)?[ _-]+(limit|quota).*(reached|exceeded|exhausted|used[ _-]+up)' "$file"; then
+    printf 'daily_limit'; return
+  fi
+  if grep -Eiq '(too[ _-]+many[ _-]+requests|rate[ _-]+limit.*(reached|exceeded|exhausted))' "$file"; then
+    printf 'rate_limited'; return
+  fi
+  if grep -Eiq 'quota.*(reached|exceeded|exhausted|used[ _-]+up)' "$file"; then
+    printf 'quota_exhausted'; return
+  fi
+}
+
+safe_source_name() {
+  printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
+}
+
 manifest_has_payload_magic() {
   local signature
   signature="$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')"
@@ -133,7 +200,14 @@ extract_source() {
   local i="$1" dir unsafe
   printf -v dir '%s/source_%04d' "$EXTRACT_DIR" "${C_INDEX[i]}"
   rm -rf "$dir"; mkdir -p "$dir"
-  unzip -q "${C_ZIP[i]}" -d "$dir" || { rm -rf "$dir"; return 1; }
+  if zip_is_safe_and_usable "${C_ZIP[i]}"; then
+    unzip -q "${C_ZIP[i]}" -d "$dir" || { rm -rf "$dir"; return 1; }
+  elif lua_is_safe_and_usable "${C_ZIP[i]}"; then
+    cp -- "${C_ZIP[i]}" "$dir/${APPID}.lua" || { rm -rf "$dir"; return 1; }
+  else
+    rm -rf "$dir"
+    return 1
+  fi
   unsafe="$(find "$dir" \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit 2>/dev/null)"
   [[ -z "$unsafe" ]] || { rm -rf "$dir"; return 1; }
   printf '%s' "${C_NAME[i]}" > "$dir/.source-name"
@@ -204,7 +278,10 @@ for ((i=0; i<n; i++)); do
   # COLLECTION_DEADLINE is only a fast-path cutoff after another source has
   # succeeded. Before that, curl owns the generous connection/inactivity guards
   # so slow links and delayed archive generation cannot become false failures.
-  stdbuf -e0 curl -sSLv -A 'discord(dot)gg/luatools' \
+  curl_auth=()
+  if [[ -n "${C_AUTH_FILE[i]}" ]]; then curl_auth=(-H "@${C_AUTH_FILE[i]}"); fi
+  stdbuf -e0 curl -sSLv --proto "${C_PROTO[i]}" --proto-redir "${C_PROTO[i]}" \
+    -A 'discord(dot)gg/luatools' "${curl_auth[@]}" \
     --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TRANSFER_TIME" \
     --speed-limit "$SPEED_LIMIT" --speed-time "$SPEED_TIME" \
     -o "${C_ZIP[i]}" "${C_URL[i]}" > /dev/null 2> "${C_PIPE[i]}" &
@@ -215,7 +292,7 @@ start_ms="$(now_ms)"
 quiet_ms="$(awk -v d="$COLLECTION_DEADLINE" 'BEGIN{printf "%.0f", d*1000}')"
 grace_ms="$(awk -v g="$COVERAGE_GRACE" 'BEGIN{printf "%.0f", g*1000}')"
 active_window_ms="$(awk -v s="$ACTIVE_PROGRESS_WINDOW" 'BEGIN{printf "%.0f", s*1000}')"
-coverage_at=""; usable_at=""; completed=0; progress_bytes=0; extension_logged=0; cancelled=0
+coverage_at=""; usable_at=""; completed=0; progress_bytes=0; progress_pct=0; extension_logged=0; cancelled=0
 for ((i=0; i<n; i++)); do
   C_SIZE[i]=0
   C_LAST_PROGRESS[i]="$start_ms"
@@ -247,7 +324,11 @@ while :; do
     wait "${C_PARSE_PID[i]}"; parse_rc=$?
     http="$(awk '/^HTTP\// { code = $2 + 0 } END { if (code) print code }' \
       "${C_HEAD[i]}" 2>/dev/null)"
-    if [[ "$rc" -ne 0 || "$parse_rc" -ne 0 ]]; then
+    limit_reason="$(source_limit_reason "${http:-0}" "${C_ZIP[i]}")"
+    if [[ -n "$limit_reason" ]]; then
+      C_STATE[i]="failed"; C_REASON[i]="$limit_reason"
+      slog "source index=${C_INDEX[i]} failed reason=$limit_reason rc=$rc http=${http:-0}"
+    elif [[ "$rc" -ne 0 || "$parse_rc" -ne 0 ]]; then
       C_STATE[i]="failed"
       if [[ "$rc" -eq 28 ]]; then C_REASON[i]="timeout"; else C_REASON[i]="transfer"; fi
       slog "source index=${C_INDEX[i]} failed reason=${C_REASON[i]} rc=$rc http=${http:-0}"
@@ -255,7 +336,7 @@ while :; do
       C_STATE[i]="failed"
       if [[ "${http:-0}" == "404" ]]; then C_REASON[i]="not_found"; else C_REASON[i]="rejected"; fi
       slog "source index=${C_INDEX[i]} failed reason=${C_REASON[i]} rc=$rc http=${http:-0}"
-    elif ! zip_is_safe_and_usable "${C_ZIP[i]}"; then
+    elif ! source_is_safe_and_usable "${C_ZIP[i]}"; then
       C_STATE[i]="failed"; C_REASON[i]="invalid_package"
       slog "source index=${C_INDEX[i]} failed reason=invalid_package rc=$rc http=${http:-0}"
     elif extract_source "$i"; then
@@ -288,6 +369,27 @@ while :; do
     fi
   done
   [[ "$totals_known" -eq 1 ]] || aggregate_total=0
+
+  # A provider such as Luie may stream a response without Content-Length. Keep
+  # byte totals honest, but calculate task progress per source so one unknown
+  # response cannot collapse the whole UI to its 1% indeterminate fallback.
+  progress_sum=0
+  for ((i=0; i<n; i++)); do
+    source_pct=0
+    source_http="$(awk '/^HTTP\// { code = $2 + 0 } END { if (code) print code }' \
+      "${C_HEAD[i]}" 2>/dev/null)"
+    if [[ "${C_STATE[i]}" != pending ]]; then
+      source_pct=100
+    elif [[ "${C_TOTAL[i]}" =~ ^[0-9]+$ && "${C_TOTAL[i]}" -gt 0 \
+        && "${source_http:-0}" == "${C_CODE[i]}" ]]; then
+      source_pct=$(( ${C_SIZE[i]:-0} * 100 / 10#${C_TOTAL[i]} ))
+      [[ "$source_pct" -gt 99 ]] && source_pct=99
+    elif [[ "${C_SIZE[i]:-0}" -gt 0 ]]; then
+      source_pct=1
+    fi
+    progress_sum=$((progress_sum + source_pct))
+  done
+  progress_pct="$(mono_pct "$progress_pct" "$((progress_sum / n))")"
   write_state downloading "" "$progress_bytes" "$aggregate_total"
   current_ms="$(now_ms)"
   if [[ -z "$usable_at" ]] && aggregate_is_usable; then
@@ -345,15 +447,41 @@ fi
 if [[ "$completed" -eq 0 ]]; then
   rm -rf "$EXTRACT_DIR"
   not_found=0; invalid=0; unavailable=0; rejected=0
+  daily=0; rate=0; quota=0
+  daily_source=""; rate_source=""; quota_source=""
   for ((i=0; i<n; i++)); do
     case "${C_REASON[i]:-}" in
       not_found) not_found=$((not_found + 1)) ;;
       invalid_package|extract) invalid=$((invalid + 1)) ;;
       rejected) rejected=$((rejected + 1)) ;;
+      daily_limit)
+        daily=$((daily + 1))
+        [[ -n "$daily_source" ]] || daily_source="$(safe_source_name "${C_NAME[i]}")"
+        ;;
+      rate_limited)
+        rate=$((rate + 1))
+        [[ -n "$rate_source" ]] || rate_source="$(safe_source_name "${C_NAME[i]}")"
+        ;;
+      quota_exhausted)
+        quota=$((quota + 1))
+        [[ -n "$quota_source" ]] || quota_source="$(safe_source_name "${C_NAME[i]}")"
+        ;;
       *) unavailable=$((unavailable + 1)) ;;
     esac
   done
-  if [[ "$not_found" -eq "$n" ]]; then
+  if [[ "$daily" -gt 0 ]]; then
+    write_state failed "" "$progress_bytes" 0 \
+      "Daily download limit reached for $daily_source. Try again tomorrow or choose another source." \
+      daily_limit source "$daily_source"
+  elif [[ "$rate" -gt 0 ]]; then
+    write_state failed "" "$progress_bytes" 0 \
+      "Too many requests to $rate_source. Wait a moment and try again." \
+      rate_limited source "$rate_source"
+  elif [[ "$quota" -gt 0 ]]; then
+    write_state failed "" "$progress_bytes" 0 \
+      "The quota for $quota_source has been exhausted. Try again later or choose another source." \
+      quota_exhausted source "$quota_source"
+  elif [[ "$not_found" -eq "$n" ]]; then
     write_state failed "" "$progress_bytes" 0 \
       "The configured sources do not have this app yet." not_found source
   elif [[ "$invalid" -gt 0 && "$unavailable" -eq 0 ]]; then

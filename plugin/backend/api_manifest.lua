@@ -4,13 +4,14 @@ local http_client = require("http_client")
 local logger = require("plugin_logger")
 local utils = require("plugin_utils")
 local paths = require("paths")
+local guard = require("guard")
 
 local api_manifest = {}
 
 local DEFAULT_API_PATH = paths.backend_path(config.API_DEFAULTS_FILE or config.API_JSON_FILE)
 local LEGACY_API_PATH = paths.backend_path(config.API_JSON_FILE)
 local USER_API_PATH = paths.backend_path("data/" .. config.API_JSON_FILE)
-local CATALOG_SCHEMA_VERSION = 1
+local CATALOG_SCHEMA_VERSION = 2
 
 local _APIS_INIT_DONE = false
 local _INIT_APIS_LAST_MESSAGE = ""
@@ -40,6 +41,32 @@ local RETIRED_BUILTIN_IDS = {
     ["moon-internal"] = true,
 }
 
+-- validate_source_url(url) -> url, or nil + error message.
+-- A custom source is fetched by the download worker and its payload becomes the
+-- game's Lua script and depot manifests. The endpoint used to accept ANY
+-- non-empty string, so "file:///etc/passwd" was a usable "source" and a URL could
+-- carry userinfo or a CRLF. A source must therefore be an http(s) URL, must carry
+-- the <appid> placeholder (otherwise it is not a per-app source at all), and must
+-- not smuggle a different authority past the reader through userinfo.
+--
+-- http is allowed on purpose: whether a mirror serves TLS is the operator's
+-- deployment choice, and refusing it would break working sources.
+local function validate_source_url(url)
+    if type(url) ~= "string" or url == "" then
+        return nil, "Invalid payload: name and url are required"
+    end
+    local checked, reason = guard.https_url(url, { allow_http = true })
+    if not checked then
+        return nil, "Source URL rejected (" .. tostring(reason)
+            .. "): it must be an http or https URL"
+    end
+    if not checked:find("<appid>", 1, true) then
+        return nil, "Source URL must contain the <appid> placeholder"
+    end
+    return checked
+end
+api_manifest.validate_source_url = validate_source_url
+
 local function copy_table(value)
     if type(value) ~= "table" then return value end
     local result = {}
@@ -56,6 +83,11 @@ local function builtin_id(api, honor_custom_marker)
         return BUILTIN_ID_ALIASES[api.builtin_id] or api.builtin_id
     end
     return LEGACY_BUILTIN_IDS[api.url]
+end
+
+local function is_managed_api(api)
+    return builtin_id(api, false) == "luie" or
+        (type(api) == "table" and api.managed == true)
 end
 
 local function read_catalog(path)
@@ -104,8 +136,10 @@ local function reconcile_catalog(defaults, user_data)
         custom.builtin_id = nil
         custom.custom = true
         custom.removed = nil
+        local checked_url = validate_source_url(custom.url)
         if type(custom.name) == "string" and custom.name ~= ""
-            and type(custom.url) == "string" and custom.url ~= "" then
+            and checked_url then
+            custom.url = checked_url
             table.insert(reconciled.api_list, custom)
         end
     end
@@ -117,17 +151,18 @@ local function reconcile_catalog(defaults, user_data)
             if default and not seen_builtins[id] then
                 local merged = copy_table(default)
                 local historical_names = HISTORICAL_BUILTIN_NAMES[id] or {}
-                if type(saved.name) == "string" and saved.name ~= ""
+                if not is_managed_api(default)
+                    and type(saved.name) == "string" and saved.name ~= ""
                     and not historical_names[saved.name] then
                     merged.name = saved.name
                 end
                 if saved.enabled ~= nil then
                     merged.enabled = saved.enabled ~= false
                 end
-                if saved.api_key ~= nil then
+                if not is_managed_api(default) and saved.api_key ~= nil then
                     merged.api_key = saved.api_key
                 end
-                if saved.removed == true then
+                if not is_managed_api(default) and saved.removed == true then
                     merged.removed = true
                     merged.enabled = false
                 end
@@ -147,6 +182,23 @@ local function reconcile_catalog(defaults, user_data)
     for _, id in ipairs(default_order) do
         if not seen_builtins[id] then
             table.insert(reconciled.api_list, copy_table(default_by_id[id]))
+        end
+    end
+
+    -- Schema v2 gives the official Luie source a useful initial position while
+    -- keeping it freely reorderable afterwards. This migration runs once; a
+    -- v2 catalogue always preserves the user's saved order.
+    if (tonumber(user_data.schema_version) or 0) < 2 then
+        local hubcap_index, luie_index
+        for index, api in ipairs(reconciled.api_list) do
+            local id = builtin_id(api, false)
+            if id == "hubcap" then hubcap_index = index end
+            if id == "luie" then luie_index = index end
+        end
+        if hubcap_index and luie_index and luie_index ~= hubcap_index + 1 then
+            local luie = table.remove(reconciled.api_list, luie_index)
+            if luie_index < hubcap_index then hubcap_index = hubcap_index - 1 end
+            table.insert(reconciled.api_list, hubcap_index + 1, luie)
         end
     end
 
@@ -242,16 +294,17 @@ function api_manifest.init_apis()
             local loaded = 0
             for _, api in ipairs(remote.api_list) do
                 local id = builtin_id(api, false)
+                local checked_url = validate_source_url(api.url)
                 if not (id and RETIRED_BUILTIN_IDS[id])
-                    and type(api.url) == "string" and api.url ~= ""
-                    and not existing_urls[api.url] then
+                    and checked_url and not existing_urls[checked_url] then
                     local item = copy_table(api)
+                    item.url = checked_url
                     item.builtin_id = nil
                     item.custom = true
                     item.remote = true
                     item.removed = nil
                     table.insert(data.api_list, item)
-                    existing_urls[item.url] = true
+                    existing_urls[checked_url] = true
                     loaded = loaded + 1
                 end
             end
@@ -315,20 +368,21 @@ function api_manifest.fetch_free_apis_now()
 
     for _, api in ipairs(remote.api_list) do
         local id = builtin_id(api, false) or live_builtin_by_url[api.url]
+        local checked_url = validate_source_url(api.url)
         if id and RETIRED_BUILTIN_IDS[id] then
             -- Explicitly retired providers never return through remote refresh.
         elseif id and live_builtins[id] then
             -- The shipped copy is authoritative and already present.
             loaded = loaded + 1
-        elseif type(api.url) == "string" and api.url ~= ""
-            and not existing_urls[api.url] then
+        elseif checked_url and not existing_urls[checked_url] then
             local item = copy_table(api)
+            item.url = checked_url
             item.builtin_id = nil
             item.custom = true
             item.remote = true
             item.removed = nil
             table.insert(retained, item)
-            existing_urls[item.url] = true
+            existing_urls[checked_url] = true
             loaded = loaded + 1
         end
     end
@@ -349,23 +403,38 @@ function api_manifest.load_api_manifest()
     local apis = {}
     for _, api in ipairs(data.api_list) do
         if api.enabled ~= false and api.removed ~= true then
-            table.insert(apis, api)
+            if is_managed_api(api) or validate_source_url(api.url) then
+                table.insert(apis, api)
+            else
+                logger.warn("LuaTools: ignoring malformed source '"
+                    .. tostring(api.name or "Unknown") .. "'")
+            end
         end
     end
     return apis
 end
 
-function api_manifest.add_custom_api(payload)
-    if not payload or type(payload.name) ~= "string" or type(payload.url) ~= "string"
-        or payload.name == "" or payload.url == "" then
+function api_manifest.add_custom_api(payload, deps)
+    if not payload or type(payload.name) ~= "string" or payload.name == "" then
         return { success = false, error = "Invalid payload: name and url are required" }
     end
+    if payload.name:lower():match("^%s*luie%s*$") then
+        return { success = false, error = "Luie is a managed lua.tools source" }
+    end
+    local url, url_error = api_manifest.validate_source_url(payload.url)
+    if not url then return { success = false, error = url_error } end
 
-    local data, err = ensure_user_catalog()
+    deps = deps or {}
+    local data, err
+    if deps.catalog then
+        data = deps.catalog()
+    else
+        data, err = ensure_user_catalog()
+    end
     if not data then return { success = false, error = err } end
     local new_api = {
         name = payload.name,
-        url = payload.url,
+        url = url,
         success_code = payload.success_code or 200,
         unavailable_code = payload.unavailable_code or 404,
         enabled = true,
@@ -376,7 +445,8 @@ function api_manifest.add_custom_api(payload)
     end
 
     table.insert(data.api_list, new_api)
-    if not write_user_catalog(data) then
+    local save = deps.save or write_user_catalog
+    if not save(data) then
         return { success = false, error = "Failed to save API catalog" }
     end
     logger.log("LuaTools: Added custom API: " .. payload.name)
@@ -389,12 +459,35 @@ function api_manifest.get_api_credential_state(api, hubcap_api_key)
     local uses_hubcap_key = builtin_id(api, true) == "hubcap"
         or string.find(url, "<moapikey>", 1, true) ~= nil
     local uses_custom_key = string.find(url, "<apikey>", 1, true) ~= nil
+    local uses_lua_tools = builtin_id(api, false) == "luie"
     local needs_key = uses_hubcap_key or uses_custom_key
     local locked = (uses_hubcap_key
             and tostring(hubcap_api_key or ""):match("%S") == nil)
         or (uses_custom_key
             and tostring(api.api_key or ""):match("%S") == nil)
-    return { needsKey = needs_key, locked = locked }
+    if uses_lua_tools then
+        local ok_auth, lua_tools_auth = pcall(require, "lua_tools_auth")
+        local ok_status, status = false, nil
+        if ok_auth and lua_tools_auth and lua_tools_auth.status then
+            ok_status, status = pcall(lua_tools_auth.status)
+        end
+        locked = not (ok_status and type(status) == "table"
+            and status.success == true and status.configured == true)
+    end
+    return {
+        needsKey = needs_key,
+        needsLogin = uses_lua_tools,
+        locked = locked,
+    }
+end
+
+local function current_hubcap_key()
+    local hubcap_api_key = ""
+    local ok, settings_manager = pcall(require, "settings.manager")
+    if ok and settings_manager and settings_manager.get_hubcap_api_key then
+        hubcap_api_key = tostring(settings_manager.get_hubcap_api_key() or "")
+    end
+    return hubcap_api_key
 end
 
 function api_manifest.get_api_list()
@@ -403,11 +496,7 @@ function api_manifest.get_api_list()
         return { success = false, error = tostring(apis), apis = {} }
     end
 
-    local hubcap_api_key = ""
-    local ok, settings_manager = pcall(require, "settings.manager")
-    if ok and settings_manager and settings_manager.get_hubcap_api_key then
-        hubcap_api_key = tostring(settings_manager.get_hubcap_api_key() or "")
-    end
+    local hubcap_api_key = current_hubcap_key()
 
     local api_names = {}
     for index, api in ipairs(apis) do
@@ -418,7 +507,9 @@ function api_manifest.get_api_list()
             name = api.name or "Unknown",
             index = index - 1,
             needsKey = credential_state.needsKey,
+            needsLogin = credential_state.needsLogin,
             locked = credential_state.locked,
+            managed = is_managed_api(api),
         })
     end
     return { success = true, apis = api_names }
@@ -428,12 +519,20 @@ function api_manifest.get_all_apis()
     local data, err = ensure_user_catalog()
     if not data then return { success = false, error = err, apis = {} } end
     local apis = {}
+    local hubcap_api_key = current_hubcap_key()
     for _, api in ipairs(data.api_list) do
         if api.removed ~= true then
+            local managed = is_managed_api(api)
+            local credential_state = api_manifest.get_api_credential_state(
+                api, hubcap_api_key)
             table.insert(apis, {
                 name = api.name or "Unknown",
-                url = api.url or "",
+                url = managed and "" or (api.url or ""),
                 enabled = api.enabled ~= false,
+                managed = managed,
+                needsKey = credential_state.needsKey,
+                needsLogin = credential_state.needsLogin,
+                locked = credential_state.locked,
             })
         end
     end
@@ -472,6 +571,10 @@ function api_manifest.remove_api(name)
         return { success = false, error = "API not found: " .. name }
     end
 
+    if is_managed_api(api) then
+        return { success = false, error = "Luie is managed and cannot be removed" }
+    end
+
     if builtin_id(api, true) then
         api.removed = true
         api.enabled = false
@@ -498,6 +601,9 @@ function api_manifest.rename_api(old_name, new_name)
     if not api then
         return { success = false, error = "API not found: " .. old_name }
     end
+    if is_managed_api(api) then
+        return { success = false, error = "Luie is managed and cannot be renamed" }
+    end
 
     api.name = new_name
     if not write_user_catalog(data) then
@@ -514,13 +620,14 @@ function api_manifest.set_api_order(ordered_names)
 
     local data, err = ensure_user_catalog()
     if not data then return { success = false, error = err } end
-    local new_list = {}
+    local reordered = {}
     local added = {}
 
     for _, name in ipairs(ordered_names) do
         for index, api in ipairs(data.api_list) do
-            if api.name == name and api.removed ~= true and not added[index] then
-                table.insert(new_list, api)
+            if api.name == name
+                and api.removed ~= true and not added[index] then
+                table.insert(reordered, api)
                 added[index] = true
                 break
             end
@@ -528,12 +635,17 @@ function api_manifest.set_api_order(ordered_names)
     end
 
     for index, api in ipairs(data.api_list) do
-        if not added[index] then
-            table.insert(new_list, api)
+        if api.removed ~= true and not added[index] then
+            table.insert(reordered, api)
+            added[index] = true
         end
     end
-
-    data.api_list = new_list
+    for index, api in ipairs(data.api_list) do
+        if api.removed == true and not added[index] then
+            table.insert(reordered, api)
+        end
+    end
+    data.api_list = reordered
     if not write_user_catalog(data) then
         return { success = false, error = "Failed to save API catalog" }
     end

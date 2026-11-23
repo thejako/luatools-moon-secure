@@ -370,16 +370,21 @@ system_patched_desktop_entries() {
 }
 
 system_restore_pending() {
-	local f backup_root
+	local f backup_root d
 	[ -n "$(system_patched_desktop_entries)" ] && return 0
-	backup_root="$HOME/.local/share/SLSsteam/system-launcher-backup"
-	if [ -d "$backup_root" ]; then
-		f="$(find "$backup_root" -type f -name '*.orig' -print -quit 2>/dev/null || true)"
-		[ -n "$f" ] && return 0
-	fi
-	if [ -f /usr/games/steam ] && grep -q "SLSsteam" /usr/games/steam 2>/dev/null; then
-		return 0
-	fi
+	for backup_root in \
+		"$HOME/.local/share/SLSsteam/system-launcher-backup" \
+		"${SLSM_SYSTEM_BACKUP_ROOT:-/var/lib/slsteam-moon/launcher-backup}"; do
+		if [ -d "$backup_root" ]; then
+			f="$(find "$backup_root" -type f -name '*.orig' -print -quit 2>/dev/null || true)"
+			[ -n "$f" ] && return 0
+		fi
+	done
+	for d in "${SLSM_LAUNCHER_DIRS[@]:-/usr/bin /usr/games /usr/local/bin}"; do
+		if [ -f "$d/steam" ] && grep -q "SLSsteam" "$d/steam" 2>/dev/null; then
+			return 0
+		fi
+	done
 	[ -d /usr/lib/millennium ] && return 0
 	[ -d /usr/share/millennium ] && return 0
 	return 1
@@ -1010,6 +1015,31 @@ uninstall_launcher_backup_is_usable() {
 if ! declare -p SLSM_LAUNCHER_DIRS >/dev/null 2>&1; then
 	SLSM_LAUNCHER_DIRS=(/usr/bin /usr/games /usr/local/bin)
 fi
+: "${SLSM_SYSTEM_BACKUP_ROOT:=/var/lib/slsteam-moon/launcher-backup}"
+
+# Copy a backup into a root-owned launcher without opening a user-tree path as
+# root. For backups below $HOME, require root ownership with no group/other
+# write (matching launcher-shim.lib.sh::ls_copy_root_written).
+uninstall_privileged_restore_copy() {
+	local sudo_cmd="$1" backup="$2" target="$3" meta
+	case "$backup" in
+		"$SLSM_SYSTEM_BACKUP_ROOT"/*)
+			$sudo_cmd cp -- "$backup" "$target" 2>/dev/null && \
+			$sudo_cmd chmod 0755 "$target" 2>/dev/null
+			return $?
+			;;
+	esac
+	exec 8< "$backup" 2>/dev/null || return 1
+	meta="$(stat -L -c '%F:%u:%a' /proc/self/fd/8 2>/dev/null || stat -f '%HT:%u:%Lp' "$backup" 2>/dev/null || true)"
+	case "$meta" in
+		"regular file:0:"*[0145][0145]|"Regular File:0:"*[0145][0145]) ;;
+		*) exec 8<&-; return 1 ;;
+	esac
+	$sudo_cmd install -m 0755 /dev/stdin "$target" <&8 2>/dev/null
+	local rc=$?
+	exec 8<&-
+	return "$rc"
+}
 
 restore_system_launchers() {
 	SLSM_KEEP_LAUNCHER_BACKUP=0
@@ -1032,6 +1062,7 @@ restore_system_launchers() {
 	fi
 
 	local backup_dir="$HOME/.local/share/SLSsteam/system-launcher-backup"
+	local sys_backup_dir="$SLSM_SYSTEM_BACKUP_ROOT"
 	local backup failed=0 wrapped_count=0 launcher d
 	local sudo_cmd=""
 	for d in "${SLSM_LAUNCHER_DIRS[@]}"; do
@@ -1042,7 +1073,7 @@ restore_system_launchers() {
 	# harmless when a managed shim is still installed: deleting the wrapper then
 	# leaves that package launcher with no recoverable fallback. Detect this state
 	# before returning and keep the uninstall retryable.
-	if [ ! -d "$backup_dir" ]; then
+	if [ ! -d "$backup_dir" ] && [ ! -d "$sys_backup_dir" ]; then
 		if [ "$wrapped_count" -gt 0 ]; then
 			SLSM_KEEP_LAUNCHER_BACKUP=1
 			SLSM_KEEP_LAUNCHER_TREE=1
@@ -1065,23 +1096,15 @@ restore_system_launchers() {
 	if load_launcher_shim_library; then
 		LS_SLSDIR="$HOME/.local/share/SLSsteam"
 		LS_BACKUP_ROOT="$backup_dir"
+		LS_SYSTEM_BACKUP_ROOT="$sys_backup_dir"
 		LS_SUDO="$sudo_cmd"
 		if ls_restore_shims; then
 			return 0
 		fi
 		while IFS= read -r launcher; do
 			[ -n "$launcher" ] || continue
-			backup="$(ls_backup_path "$launcher")"
-			if ! uninstall_launcher_backup_is_usable "$backup" || \
-			   ! uninstall_shim_references_backup "$launcher" "$backup"; then
-				backup="$(ls_legacy_backup_path "$launcher")"
-				if ! ls_legacy_backup_is_unambiguous_restore "$backup" || \
-				   ! uninstall_shim_references_backup "$launcher" "$backup"; then
-					SLSM_KEEP_LAUNCHER_TREE=1
-				fi
-			fi
-			if ! uninstall_launcher_backup_is_usable "$backup" || \
-			   ! uninstall_shim_references_backup "$launcher" "$backup"; then
+			if ! backup="$(ls_referenced_backup "$launcher" 2>/dev/null)"; then
+				backup="$(ls_backup_path "$launcher")"
 				SLSM_KEEP_LAUNCHER_TREE=1
 			fi
 			SLSM_KEEP_LAUNCHER_BACKUP=1
@@ -1091,11 +1114,9 @@ restore_system_launchers() {
 		return 1
 	fi
 
-	# Legacy fallback: support both the historical flat steam.orig and the
-	# path-mirrored layout even when the shared library is unavailable. A
-	# mirrored restore can make a flat backup unambiguous, so retry after every
-	# pass that makes progress.
-	local pass_progress remaining relative base parent orig_path p candidate_backup
+	# Legacy fallback: support the root-owned /var/lib mirror, the home mirror,
+	# and the historical flat steam.orig when the shared library is unavailable.
+	local pass_progress remaining relative base parent orig_path p candidate_backup root_entry
 	while :; do
 		failed=0
 		pass_progress=0
@@ -1108,7 +1129,10 @@ restore_system_launchers() {
 		done
 
 		while IFS= read -r -d '' backup; do
-			relative="${backup#"$backup_dir"/}"
+			case "$backup" in
+				"$sys_backup_dir"/*) relative="${backup#"$sys_backup_dir"/}" ;;
+				*)                   relative="${backup#"$backup_dir"/}" ;;
+			esac
 			base="${relative##*/}"
 			base="${base%.orig}"
 			parent="${relative%/*}"
@@ -1163,23 +1187,27 @@ restore_system_launchers() {
 				continue
 			fi
 
-			if [ -n "$sudo_cmd" ]; then
-				if $sudo_cmd cp -- "$backup" "$orig_path" 2>/dev/null \
-				   && $sudo_cmd chmod 0755 "$orig_path" 2>/dev/null \
+			if [ -w "$orig_path" ] \
+			   && cp -- "$backup" "$orig_path" 2>/dev/null \
+			   && chmod 0755 "$orig_path" 2>/dev/null \
+			   && ! is_our_launcher_shim "$orig_path"; then
+				log_success "$(L "Restored $orig_path" "$orig_path restaurado")"
+				pass_progress=1
+				continue
+			elif [ -n "$sudo_cmd" ]; then
+				if uninstall_privileged_restore_copy "$sudo_cmd" "$backup" "$orig_path" \
 				   && ! is_our_launcher_shim "$orig_path"; then
+					case "$backup" in
+						"$sys_backup_dir"/*)
+							$sudo_cmd rm -f -- "$backup" "${backup%/*}/steam" 2>/dev/null || true
+							;;
+					esac
 					log_success "$(L "Restored $orig_path" "$orig_path restaurado")"
 					pass_progress=1
 					continue
 				fi
 				log_warn "$(L "Could not restore $orig_path (sudo failed)" \
 				           "Não foi possível restaurar $orig_path (sudo falhou)")"
-			elif [ -w "$orig_path" ] \
-			     && cp -- "$backup" "$orig_path" 2>/dev/null \
-			     && chmod 0755 "$orig_path" 2>/dev/null \
-			     && ! is_our_launcher_shim "$orig_path"; then
-				log_success "$(L "Restored $orig_path" "$orig_path restaurado")"
-				pass_progress=1
-				continue
 			else
 				log_warn "$(L "Cannot restore $orig_path without administrator access" \
 				           "Não é possível restaurar $orig_path sem acesso de administrador")"
@@ -1191,12 +1219,10 @@ restore_system_launchers() {
 			SLSM_KEEP_LAUNCHER_BACKUP=1
 			log_info "$(L "$orig_path keeps working through the retained backup. To finish: sudo cp '$backup' '$orig_path'" \
 			             "$orig_path continua funcionando pelo backup mantido. Para concluir: sudo cp '$backup' '$orig_path'")"
-		# Enumerate path-mirrored backups first. Flat legacy backups are handled
-		# only after their exact surviving shim association is verified, so find
-		# order cannot restore one into the wrong launcher.
 		done < <(
-			find "$backup_dir" -mindepth 2 -type f -name '*.orig' -print0 2>/dev/null
-			find "$backup_dir" -maxdepth 1 -type f -name '*.orig' -print0 2>/dev/null
+			[ -d "$sys_backup_dir" ] && find "$sys_backup_dir" -mindepth 2 -type f -name '*.orig' -print0 2>/dev/null
+			[ -d "$backup_dir" ] && find "$backup_dir" -mindepth 2 -type f -name '*.orig' -print0 2>/dev/null
+			[ -d "$backup_dir" ] && find "$backup_dir" -maxdepth 1 -type f -name '*.orig' -print0 2>/dev/null
 		)
 
 		# Do not declare success merely because every discovered backup was consumed:
@@ -1207,15 +1233,17 @@ restore_system_launchers() {
 			if is_our_launcher_shim "$launcher"; then
 				remaining=1
 				failed=1
-				candidate_backup="$backup_dir/${launcher#/}.orig"
-				if ! uninstall_launcher_backup_is_usable "$candidate_backup" || \
-				   ! uninstall_shim_references_backup "$launcher" "$candidate_backup"; then
-					candidate_backup="$backup_dir/$(basename -- "$launcher").orig"
-					if ! uninstall_launcher_backup_is_usable "$candidate_backup" || \
-					   ! uninstall_shim_references_backup "$launcher" "$candidate_backup"; then
-						SLSM_KEEP_LAUNCHER_TREE=1
+				candidate_backup=""
+				for root_entry in "$sys_backup_dir/${launcher#/}.orig" \
+				                  "$backup_dir/${launcher#/}.orig" \
+				                  "$backup_dir/$(basename -- "$launcher").orig"; do
+					if uninstall_launcher_backup_is_usable "$root_entry" && \
+					   uninstall_shim_references_backup "$launcher" "$root_entry"; then
+						candidate_backup="$root_entry"
+						break
 					fi
-				fi
+				done
+				[ -n "$candidate_backup" ] || SLSM_KEEP_LAUNCHER_TREE=1
 				SLSM_KEEP_LAUNCHER_BACKUP=1
 				log_warn "$(L "System launcher shim remains at $launcher; retaining backups" \
 				           "O shim do lançador de sistema continua em $launcher; mantendo backups")"
@@ -1400,14 +1428,19 @@ uninstall_slsteam_moon() {
 	fi
 
 	# User config (depot keys, additional apps, scan caches).
-	if [ -d "$HOME/.config/SLSsteam" ]; then
-		log_step "$(L "Removing ~/.config/SLSsteam (depot keys, config)" \
-		             "Removendo ~/.config/SLSsteam (depot keys, config)")"
+	local sls_cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/SLSsteam"
+	case "${XDG_CONFIG_HOME:-}" in /*) ;; *) sls_cfg_dir="$HOME/.config/SLSsteam" ;; esac
+	if [ -d "$sls_cfg_dir" ]; then
+		log_step "$(L "Removing $sls_cfg_dir (depot keys, config)" \
+		             "Removendo $sls_cfg_dir (depot keys, config)")"
+		rm -rf "$sls_cfg_dir" 2>/dev/null || true
+	fi
+	if [ "$sls_cfg_dir" != "$HOME/.config/SLSsteam" ] && [ -d "$HOME/.config/SLSsteam" ]; then
 		rm -rf "$HOME/.config/SLSsteam" 2>/dev/null || true
 	fi
 
-	# Log file written by SLSsteam.so.
-	rm -f "$HOME/.SLSsteam.log" 2>/dev/null || true
+	# Log file and rotated generations written by SLSsteam.so.
+	rm -f "$HOME/.SLSsteam.log" "$HOME/.SLSsteam.log".[0-9]* 2>/dev/null || true
 
 	# Gatekeeper security config and isolated stplug-in cleanup
 	pkill -f "gatekeeper-watcher" 2>/dev/null || true
@@ -1714,10 +1747,12 @@ main() {
 	uninstall_luatools_plugin
 
 	print_section "$(L "Removing Lumen" "Removendo Lumen")"
-	uninstall_lumen
-
+	uninstall_lumen    
+	
+	if [ -z "${LUATOOLS_MOON_KEEP_MILLENNIUM:-}" ]; then
 	print_section "$(L "Removing Millennium" "Removendo Millennium")"
 	uninstall_millennium
+    fi	
 
 	print_section "$(L "Removing slsteam-moon" "Removendo slsteam-moon")"
 	uninstall_slsteam_moon

@@ -10,6 +10,8 @@ local api_manifest = require("api_manifest")
 local settings_manager = require("settings.manager")
 local cjson = require("json")
 local smart_merge = require("smart_merge")
+local lua_tools_manifest = require("lua_tools_manifest")
+local source_limits = require("source_limits")
 
 local downloads = {}
 local DOWNLOAD_STATE = {}
@@ -194,10 +196,12 @@ function downloads.get_add_status(appid)
                     error = data.error,
                     bytesRead = data.bytesRead,
                     totalBytes = data.totalBytes,
+                    progress = data.progress,
                     currentApi = data.currentApi,
                     apiErrors = data.apiErrors,
                     errorCode = data.errorCode,
                     errorPhase = data.errorPhase,
+                    errorSource = data.errorSource,
                 })
 
                 if data.status == "collected" or data.status == "extracted" then
@@ -295,12 +299,34 @@ function downloads.start_add_via_luatools_from_url(appid, url, apiName, success_
     local code = tonumber(success_code) or 200
     if code < 100 or code > 599 then code = 200 end
     local name = tostring(apiName or "Manual source"):gsub("%z", "")
-    local records = { table.concat({ "0", name, url, tostring(code), "" }, "\0") }
+    local records = {
+        table.concat({ "0", name, url, tostring(code), "" }, "\0") .. "\0"
+    }
     return _start_smart_records(appid, records, name)
 end
 
 function downloads.start_add_via_luatools(appid)
     return downloads.start_add_via_luatools_smart(appid)
+end
+
+function downloads.start_add_via_luatools_source(appid, source_name)
+    if type(appid) == "string" then appid = tonumber(appid) end
+    if not appid then return { success = false, error = "Invalid appid" } end
+    if tostring(source_name or ""):lower() ~= "luie" then
+        return { success = false, error = "Unknown managed source" }
+    end
+    local candidate, candidate_error = lua_tools_manifest.download_candidate(appid)
+    if not candidate then
+        return {
+            success = false,
+            errorCode = type(candidate_error) == "table" and candidate_error.code or "not_signed_in",
+            error = type(candidate_error) == "table" and candidate_error.message or "Sign in to lua.tools first.",
+        }
+    end
+    local record = table.concat({
+        "0", "Luie", candidate.url, tostring(candidate.successCode or 200), candidate.bearer,
+    }, "\0") .. "\0"
+    return _start_smart_records(appid, { record }, "Luie")
 end
 
 function downloads.check_apis_for_app(appid)
@@ -327,7 +353,25 @@ function downloads.check_apis_for_app(appid)
                 name = name,
                 available = false,
                 needsKey = credential_state.needsKey,
+                needsLogin = credential_state.needsLogin,
+                managed = api.builtin_id == "luie",
                 locked = true,
+            })
+            goto continue
+        end
+
+        if api.builtin_id == "luie" then
+            local status = lua_tools_manifest.check(appid)
+            local limit_code = source_limits.classify(nil, status.status)
+            table.insert(results, {
+                name = name,
+                available = status.available == true and not limit_code,
+                managed = true,
+                needsLogin = true,
+                locked = status.locked == true,
+                status = status.status,
+                errorCode = limit_code,
+                error = source_limits.message(limit_code, name),
             })
             goto continue
         end
@@ -341,22 +385,29 @@ function downloads.check_apis_for_app(appid)
 
         local url = template:gsub("<appid>", tostring(appid))
         local available = false
+        local limit_code
 
         if _is_hubcap_api(api) then
             local status_url = "https://hubcapmanifest.com/api/v1/status/" .. tostring(appid) .. "?api_key=" .. tostring(hubcap_api_key)
             local resp = http_client.get(status_url, { headers = { ["User-Agent"] = config.USER_AGENT }, timeout = 5 })
-            if resp and resp.status == success_code then
+            limit_code = type(resp) == "table"
+                and source_limits.classify(resp.status, resp.body) or nil
+            if not limit_code and resp and resp.status == success_code then
                 available = true
             end
         else
             local success = false
             local resp = http_client.head(url, { headers = { ["User-Agent"] = config.USER_AGENT }, timeout = 5 })
-            if resp and resp.status == success_code then
+            limit_code = type(resp) == "table"
+                and source_limits.classify(resp.status, resp.body) or nil
+            if not limit_code and resp and resp.status == success_code then
                 success = true
-            else
+            elseif not limit_code then
                 -- Fallback to GET if HEAD fails
                 local get_resp = http_client.get(url, { headers = { ["User-Agent"] = config.USER_AGENT }, timeout = 5 })
-                if get_resp and get_resp.status == success_code then
+                limit_code = type(get_resp) == "table"
+                    and source_limits.classify(get_resp.status, get_resp.body) or nil
+                if not limit_code and get_resp and get_resp.status == success_code then
                     success = true
                 end
             end
@@ -373,6 +424,8 @@ function downloads.check_apis_for_app(appid)
             successCode = success_code,
             needsKey = credential_state.needsKey,
             locked = false,
+            errorCode = limit_code,
+            error = source_limits.message(limit_code, name),
         })
 
         ::continue::
@@ -399,7 +452,8 @@ local function _shell_quote(value)
     return "'" .. tostring(value or ""):gsub("'", "'\\''") .. "'"
 end
 
-local function _launch_smart_download(appid, candidates_file, coverage_file, dest_root, state_file, stop_file)
+local function _launch_smart_download(appid, candidates_file, coverage_file,
+        dest_root, state_file, stop_file)
     local sh_path = fs.join(paths.get_plugin_dir(), "backend", "scripts", "smart_download.sh")
     m_utils.exec("chmod +x -- " .. _shell_quote(sh_path))
     -- Capture the detached worker's stdout+stderr into ~/.lumen.log (was
@@ -431,7 +485,18 @@ end
 -- state file every poll (~0.2s) while alive, so a fresh mtime means a live
 -- worker; a stale one means it crashed and a relaunch is safe.
 local function _smart_state_age(state_file)
-    local p = io.popen('stat -c %Y "' .. state_file .. '" 2>/dev/null')
+    -- Prefer lfs: no shell at all. This used to be
+    --   io.popen('stat -c %Y "' .. state_file .. '" ...')
+    -- and double quotes do not suppress $(...) or `...`, which a user-named Steam
+    -- library path can legitimately contain. Where lfs is unavailable (host test
+    -- tooling on LuaJIT), fall back to stat with the path single-quoted.
+    local ok_lfs, lfs = pcall(require, "lfs")
+    if ok_lfs then
+        local mtime = lfs.attributes(state_file, "modification")
+        if type(mtime) ~= "number" then return 1 / 0 end
+        return os.time() - mtime
+    end
+    local p = io.popen("stat -c %Y -- " .. _shell_quote(state_file) .. " 2>/dev/null")
     if not p then return 1 / 0 end
     local out = p:read("*a") or ""
     p:close()
@@ -496,7 +561,20 @@ local function _smart_records_for_app(appid)
         local name = tostring(api.name or "Unknown"):gsub("%z", "")
         local template = tostring(api.url or ""):gsub("%z", "")
         local credential_state = api_manifest.get_api_credential_state(api, hubcap_api_key)
-        local skip = template == "" or credential_state.locked
+        local skip = credential_state.locked
+        if api.builtin_id == "luie" then
+            if not skip then
+                local candidate = lua_tools_manifest.download_candidate(appid)
+                if candidate then
+                    records[#records + 1] = table.concat({
+                        tostring(index - 1), name, candidate.url,
+                        tostring(candidate.successCode or 200), candidate.bearer,
+                    }, "\0") .. "\0"
+                end
+            end
+            goto continue
+        end
+        skip = skip or template == ""
         if not skip and string.find(template, "<moapikey>", 1, true) then
             template = template:gsub("<moapikey>", hubcap_api_key)
         end
@@ -507,8 +585,9 @@ local function _smart_records_for_app(appid)
             records[#records + 1] = table.concat({
                 tostring(index - 1), name, template:gsub("<appid>", tostring(appid)),
                 tostring(tonumber(api.success_code) or 200), "",
-            }, "\0")
+            }, "\0") .. "\0"
         end
+        ::continue::
     end
     if #records == 0 then return nil, "No usable API sources" end
     return records
@@ -533,7 +612,7 @@ _start_smart_records = function(appid, records, current_api)
         DOWNLOAD_STATE[appid] = {}
         _set_download_state(appid, {
             status = "downloading", currentApi = current_api or "",
-            bytesRead = 0, totalBytes = 0,
+            bytesRead = 0, totalBytes = 0, progress = 0,
         })
         _launch_smart_download(appid, job.candidates, job.coverage,
             job.root, job.state, job.stop)
@@ -707,6 +786,7 @@ function downloads.get_game_draft_status(appid, session)
             memory.errorCode = data.errorCode
             memory.bytesRead = data.bytesRead
             memory.totalBytes = data.totalBytes
+            memory.progress = data.progress
             memory.currentApi = data.currentApi
             if (data.status == "collected" or data.status == "ready")
                 and not memory.draft and not DRAFT_FINALIZING[session] then
@@ -735,6 +815,36 @@ function downloads.get_game_draft_status(appid, session)
     end
     if not memory then return { success = false, error = "Unknown or expired draft" } end
     return { success = true, state = _copy_table(memory) }
+end
+
+-- Return the complete validated draft to another local backend module. This is
+-- intentionally not sent through JSON/CDP: callers receive binary manifest
+-- bytes only inside the Lumen process and can attach them to a private import
+-- transaction without exposing or base64-copying them through the browser.
+function downloads.get_game_draft_snapshot(appid, session)
+    appid = _positive_appid(appid)
+    local job = appid and _draft_job_paths(appid, session) or nil
+    local memory = type(session) == "string" and DRAFT_STATE[session] or nil
+    if not job or not memory or memory.appid ~= appid or memory.status ~= "ready" then
+        return { success = false, error = "Draft is not ready" }
+    end
+    local preview, preview_error = smart_merge.preview(
+        appid, job.collection, _merge_options(appid))
+    if not preview then return { success = false, error = tostring(preview_error) } end
+    local manifests = {}
+    for _, item in ipairs(preview.manifests or {}) do
+        if type(item.content) == "string" then
+            manifests[#manifests + 1] = {
+                name = tostring(item.depot) .. "_" .. tostring(item.gid) .. ".manifest",
+                data = item.content,
+            }
+        end
+    end
+    table.sort(manifests, function(left, right) return left.name < right.name end)
+    return {
+        success = true, appid = appid, lua = preview.lua_text,
+        manifests = manifests,
+    }
 end
 
 function downloads.commit_game_draft(appid, session, edits)
